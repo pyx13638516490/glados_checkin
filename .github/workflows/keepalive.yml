@@ -1,0 +1,64 @@
+name: Keep Scheduled Workflows Active
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly check; it only commits when the last keepalive is 45+ days old.
+    - cron: '23 2 * * 0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keep-scheduled-workflows-active
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.KEEPALIVE_TOKEN || github.token }}
+
+      - name: Commit keepalive marker when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          path=".github/keepalive.txt"
+          today="$(date -u +%F)"
+          last="1970-01-01"
+
+          if [ -f "$path" ]; then
+            last="$(sed -n 's/^last_active=//p' "$path" | tail -n 1)"
+            if [ -z "$last" ]; then
+              last="1970-01-01"
+            fi
+          fi
+
+          last_epoch="$(date -u -d "$last" +%s 2>/dev/null || echo 0)"
+          now_epoch="$(date -u +%s)"
+          age_days="$(( (now_epoch - last_epoch) / 86400 ))"
+
+          if [ "$age_days" -lt 45 ]; then
+            echo "Last keepalive was ${age_days} days ago; no commit needed."
+            exit 0
+          fi
+
+          mkdir -p "$(dirname "$path")"
+          printf 'last_active=%s\n' "$today" > "$path"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$path"
+
+          if git diff --cached --quiet; then
+            echo "No keepalive change to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: keep scheduled workflows active"
+          git push
