@@ -1,29 +1,61 @@
 name: GLaDOS Checkin
 
 on:
-  schedule:
-    - cron: "0 1 * * *"
   workflow_dispatch:
+  schedule:
+    # GitHub schedules use UTC. These are Beijing 09:17 and 15:47.
+    # Avoid minute 0 because scheduled workflows can be delayed or dropped
+    # during high-load periods. The afternoon run is a cloud-side retry.
+    - cron: '17 1 * * *'
+    - cron: '47 7 * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run checkin script
+        id: first_checkin
+        continue-on-error: true
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
         run: python checkin.py
+
+      - name: Wait 5 minutes before retry
+        if: steps.first_checkin.outcome == 'failure'
+        run: sleep 300
+
+      - name: Retry checkin script
+        id: retry_checkin
+        if: steps.first_checkin.outcome == 'failure'
+        env:
+          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+        run: python checkin.py
+
+      - name: Confirm checkin result
+        if: steps.first_checkin.outcome == 'failure' && steps.retry_checkin.outcome == 'failure'
+        run: |
+          echo "Both the first checkin attempt and the 5-minute retry failed."
+          exit 1
