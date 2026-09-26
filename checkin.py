@@ -44,6 +44,12 @@ AUTH_ERROR_MARKERS = (
     "invalid cookie",
     "cookie expired",
     "session expired",
+    # GLaDOS 的错误消息是中文的：实测 /api/user/status 在 cookie 无效时返回
+    # {"code":-2,"message":"没有权限"}。不匹配中文就会被误判成 unknown。
+    "没有权限",
+    "未登录",
+    "请先登录",
+    "登录已过期",
 )
 
 

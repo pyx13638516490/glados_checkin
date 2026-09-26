@@ -63,7 +63,9 @@ def test_classify():
         ("重复签到算成功", {"code": 1, "message": "Checkin Repeats! Please Try Tomorrow"}, "success"),
         ("新版文案", {"code": 1, "message": "Today's observation logged"}, "success"),
         ("code=0 无文案", {"code": 0, "message": ""}, "success"),
-        ("cookie 失效", {"code": -1, "message": "Not logged in"}, "auth_error"),
+        ("cookie 失效(英文)", {"code": -1, "message": "Not logged in"}, "auth_error"),
+        ("cookie 失效(中文-没有权限)", {"code": -2, "message": "没有权限"}, "auth_error"),
+        ("cookie 失效(中文-未登录)", {"code": -2, "message": "未登录"}, "auth_error"),
         ("不认识的响应", {"code": 9, "message": "Something new"}, "unknown"),
         ("非 JSON 响应", {"code": None, "message": "Non-JSON response", "text": "<html>"}, "unknown"),
     ]
