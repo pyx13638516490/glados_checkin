@@ -3,9 +3,8 @@ name: GLaDOS Checkin
 on:
   workflow_dispatch:
   schedule:
-    # GitHub schedules use UTC. These are Beijing 09:17 and 15:47.
-    # Avoid minute 0 because scheduled workflows can be delayed or dropped
-    # during high-load periods. The afternoon run is a cloud-side retry.
+    # GitHub 使用 UTC。下面对应北京时间 09:17 与 15:47。
+    # 避开整点：高峰时段计划任务可能被延迟甚至丢弃。
     - cron: '17 1 * * *'
     - cron: '47 7 * * *'
 
@@ -41,22 +40,36 @@ jobs:
         continue-on-error: true
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-        run: python checkin.py
+          GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
+        run: |
+          python checkin.py
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
 
-      - name: Wait 5 minutes before retry
-        if: steps.first_checkin.outcome == 'failure'
-        run: sleep 300
+      # 退出码 2 = 网络或服务端临时故障，重试有意义。
+      # 退出码 1 = token / cookie / 响应结构问题，重试必然同样失败，
+      # 所以不再像旧版那样无条件 sleep 5 分钟再跑一遍。
+      - name: Wait 60s before retry
+        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
+        run: sleep 60
 
       - name: Retry checkin script
         id: retry_checkin
-        if: steps.first_checkin.outcome == 'failure'
+        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
         continue-on-error: true
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+          GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
         run: python checkin.py
 
-      - name: Confirm checkin result
-        if: steps.first_checkin.outcome == 'failure' && steps.retry_checkin.outcome == 'failure'
+      - name: Report failure
+        if: steps.first_checkin.outcome == 'failure'
         run: |
-          echo "Both the first checkin attempt and the 5-minute retry failed."
+          if [ "${{ steps.first_checkin.outputs.exit_code }}" = "1" ]; then
+            echo "签到失败，且属于不可重试错误（token / cookie / 响应结构）。"
+            echo "请查看上方日志里的 ERROR 说明，按提示修复；重试同一个配置不会成功。"
+          else
+            echo "签到在重试后仍然失败（临时故障或服务端不可用）。"
+          fi
           exit 1

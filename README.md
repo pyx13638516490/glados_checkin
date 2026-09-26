@@ -1,28 +1,43 @@
 # GLaDOS 自动签到
 
-这个仓库提供一个基于 Python `requests` 的 `glados.cloud` 自动签到脚本，并通过 GitHub Actions 每天定时执行。
+基于 Python `requests` 的 `glados.cloud` 自动签到脚本，通过 GitHub Actions 每天定时执行。
 
-## 技术方案
+## 2026 API 变更：为什么旧脚本会失败
 
-脚本按固定两步执行：
+GLaDOS 在 2026 年初更新了签到接口，**签到 token 从 `glados.one` 改为 `glados.cloud`**。
 
-1. 调用签到接口 `POST https://glados.cloud/api/user/checkin`
-2. 调用状态接口 `GET https://glados.cloud/api/user/status`，读取 `data.leftDays`
+这个变更的表现很容易被误判：
 
-鉴权方式直接使用完整的 Cookie 字符串，从环境变量 `GLADOS_COOKIE` 读取，并原样放入请求头 `Cookie`。这适合包含 `koa:sess` 和 `koa:sess.sig` 的场景，不需要在脚本里单独拆分。
+| 现象 | 真相 |
+| --- | --- |
+| 接口返回 HTTP **200**（不是 403/429） | 不是被拦截，服务端正常接受了请求 |
+| message 是 `please checkin via https://glados.cloud` | token 不匹配，签到没有生效 |
+| 手动点签到按钮正常，脚本不行 | 浏览器发的是新 token，脚本发的是旧 token |
+| 日志显示"完成"，但积分没涨 | 旧脚本从不校验签到结果 |
 
-默认签到请求体为：
+> **这不是反脚本检测。** 本项目实测确认，下面这些"绕过检测"的方向对这个问题**全部无效**：
+> 补 `sec-ch-ua` / `sec-fetch-*` 请求头、换 User-Agent、用 `curl_cffi` 伪造浏览器 TLS 指纹、挂代理。
+> 真正有效的修复只有一个字符改动：token 值。
 
-```json
-{
-  "token": "glados.one"
-}
-```
+如果以后又出现"疑似被检测"，**先怀疑 API 变更**，不要往对抗检测的方向走——那条路在这个项目上已经被证明是死路。
 
-如果后续站点调整了 token 或域名，可以通过环境变量覆盖：
+## 本次修复内容
 
-- `GLADOS_BASE_URL`
-- `GLADOS_CHECKIN_TOKEN`
+1. **token 修正**：`DEFAULT_CHECKIN_TOKEN` 从 `glados.one` 改为 `glados.cloud`。
+   若仓库变量 `GLADOS_CHECKIN_TOKEN` 仍残留旧值，脚本会自动纠正并打印警告。
+2. **不再静默失败**（最重要）：旧脚本发完签到请求后只检查认证错误，从不判断签到本身是否成功，
+   所以 token 失效时它照样打印 `leftDays` 并**以退出码 0 正常结束**——表面成功、实际没签到。
+   新脚本显式分类签到响应，无法确认时宁可报失败，也不谎报成功。
+3. **修正 `leftDays` 的误用**：它是会员剩余天数，和签到是否生效无关（签到发的是积分）。
+   新增读取 `/api/user/points`，输出当前积分与最近一次变化，作为签到生效的对照依据。
+4. **退出码语义化**，供 workflow 判断是否值得重试：
+   - `0` 成功
+   - `1` 不可重试失败（token / cookie / 响应结构变更）
+   - `2` 可重试失败（429 / 5xx / 连接异常）
+5. **取消无意义重试**：旧 workflow 在任何失败后都 `sleep 300` 再跑一遍，但 token 错误重试必然同样失败。
+   现在只有退出码 `2` 才触发重试。
+6. **收紧认证判定**：旧脚本用 `"login"`、`"cookie"` 这类宽泛关键词匹配，容易把正常响应误判为认证失败。
+7. **空环境变量不再覆盖默认值**：GitHub 上定义了但留空的变量会被当作"未设置"。
 
 ## 目录结构
 
@@ -32,81 +47,70 @@
 |   `-- workflows
 |       `-- checkin.yml
 |-- checkin.py
+|-- test_checkin.py
 |-- requirements.txt
 `-- README.md
 ```
 
-## 本地运行
+## GitHub 上的配置
 
-1. 安装依赖
+1. 把本目录文件推送到仓库（覆盖旧的 `checkin.py` 和 workflow）。
+2. `Settings` → `Secrets and variables` → `Actions` → `New repository secret`：
+   - 名称 `GLADOS_COOKIE`，值为浏览器里复制的完整 Cookie，至少包含 `koa:sess` 和 `koa:sess.sig`。
+3. **如果之前建过 `GLADOS_CHECKIN_TOKEN` 变量，请删除它**（或者把它设为 `glados.cloud`）。
+   留着旧值虽然会被脚本自动纠正，但会持续打印警告。
+4. 到 `Actions` 页面手动跑一次 `GLaDOS Checkin`，确认日志正常。
+
+## 本地运行
 
 ```bash
 pip install -r requirements.txt
-```
-
-2. 设置环境变量
-
-```bash
 export GLADOS_COOKIE='koa:sess=xxx; koa:sess.sig=yyy'
+python checkin.py
+echo "exit=$?"
 ```
 
 Windows PowerShell:
 
 ```powershell
 $env:GLADOS_COOKIE='koa:sess=xxx; koa:sess.sig=yyy'
-```
-
-3. 执行脚本
-
-```bash
 python checkin.py
 ```
 
-## GitHub Actions 配置
+跑自测（不联网，全部走 mock）：
 
-工作流文件为 `.github/workflows/checkin.yml`。
-
-- 触发时间：`0 1 * * *`
-- 含义：每天 `01:00 UTC`
-- 换算为北京时间：每天早上 `09:00`（UTC+8）
-
-同时保留了 `workflow_dispatch`，可以在 GitHub 页面手动点一次运行，方便测试。
-
-## GitHub 上的配置步骤
-
-1. 在 GitHub 新建仓库，并把本目录文件推送上去。
-2. 进入仓库页面的 `Settings`。
-3. 打开 `Secrets and variables` -> `Actions`。
-4. 点击 `New repository secret`。
-5. 名称填写 `GLADOS_COOKIE`。
-6. 值填写浏览器里复制出来的完整 Cookie 字符串，至少要包含：
-
-```text
-koa:sess=...; koa:sess.sig=...
+```bash
+python test_checkin.py
 ```
 
-7. 保存后进入 `Actions` 页面。
-8. 首次可以手动执行 `GLaDOS Checkin` 工作流，确认日志正常。
+## 环境变量
 
-## 日志输出
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `GLADOS_COOKIE` | 无（必需） | 完整 Cookie 字符串 |
+| `GLADOS_CHECKIN_TOKEN` | `glados.cloud` | 签到 token，一般不需要改 |
+| `GLADOS_BASE_URL` | `https://glados.cloud` | 主域名 |
+| `GLADOS_DOMAIN_FALLBACK` | `1` | 设 `0` 关闭 `rocks` / `network` 域名回退 |
 
-脚本会在控制台打印：
+## 排查指南
 
-- 签到接口 URL
-- 签到接口 HTTP 状态码
-- 签到接口返回 JSON
-- 状态接口 HTTP 状态码
-- 状态接口返回 JSON
-- 当前剩余天数
+看 Actions 日志里最后那段 `ERROR:`，它直接给出结论和修复方式。
 
-## Cookie 获取说明
+| 日志关键字 | 含义 | 处理 |
+| --- | --- | --- |
+| `签到 token 已失效` | token 不对，签到未生效 | 删除 `GLADOS_CHECKIN_TOKEN` 变量 |
+| `Cookie 已失效` | 会话过期 | 重新登录复制 Cookie，更新 `GLADOS_COOKIE` |
+| `签到响应无法识别` | API 可能又变了，或返回了未适配的新文案 | 对照控制台积分确认，把日志里的响应内容提 Issue |
+| `读取 status 失败` / `读取 points 失败` | 只影响信息展示，签到结论仍然有效 | 可忽略，除非持续出现 |
+| `可重试的 HTTP 状态` | 服务端 5xx 或限流 | 无需处理，workflow 会自动重试一次 |
 
-在浏览器登录 `https://glados.cloud` 后：
+判断签到是否真的生效，看 `Current points` 那一行有没有增加，**不要看 `leftDays`**。
 
-1. 打开开发者工具
-2. 进入 `Application` 或 `Storage`
-3. 找到站点 Cookie
-4. 复制完整 Cookie 字符串
-5. 确保其中包含 `koa:sess` 和 `koa:sess.sig`
+## Cookie 获取
 
-建议不要只复制单个字段，直接复制整段 Cookie 并写入 `GLADOS_COOKIE`。
+登录 `https://glados.cloud` 后：
+
+1. 打开开发者工具，进入 `Application` → `Cookies`
+2. 复制 `koa:sess` 和 `koa:sess.sig` 两个值
+3. 拼成 `koa:sess=长串; koa:sess.sig=短串`（分号后有且仅有一个空格）
+4. 整段写入 `GLADOS_COOKIE`
