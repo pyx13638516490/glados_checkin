@@ -1,0 +1,11 @@
+run_number=151
+sha=743b9eba505d18c2db9477135898dcdbda34a292
+exit_code=1
+time_utc=2026-09-26T03:36:31Z
+--- script output ---
+[2026-09-26 11:36:30 UTC+08:00] Cookie 长度 135，sha256 指纹 6a2c9cbaf3ec
+[2026-09-26 11:36:30 UTC+08:00] 签到域名候选: https://glados.cloud, https://glados.rocks, https://glados.network
+[2026-09-26 11:36:30 UTC+08:00] POST https://glados.cloud/api/user/checkin (attempt 1/3)
+[2026-09-26 11:36:31 UTC+08:00] HTTP 200: {"code": -2, "message": "没有权限"}
+[2026-09-26 11:36:31 UTC+08:00] ERROR: Cookie 已失效。请重新登录 glados.cloud，复制 koa:sess 与 koa:sess.sig，更新 GitHub Secret GLADOS_COOKIE。
+  接口返回: '没有权限'
