@@ -92,28 +92,14 @@ python test_checkin.py
 | `GLADOS_CHECKIN_TOKEN` | `glados.cloud` | 签到 token，一般不需要改 |
 | `GLADOS_BASE_URL` | `https://glados.cloud` | 主域名 |
 | `GLADOS_DOMAIN_FALLBACK` | `1` | 设 `0` 关闭 `rocks` / `network` 域名回退 |
-| `PUSHPLUS_TOKEN` | 无（可选） | 签到失败时推送微信提醒，见下节 |
-
-## 失败时的微信提醒（可选）
-
-签到失败时除了 GitHub 的邮件通知，还可以直接推到微信。配置一次即可：
-
-1. 打开 https://www.pushplus.plus ，用微信扫码登录
-2. 复制页面上显示的**一对一推送 token**
-3. 仓库 → `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
-4. 名称填 `PUSHPLUS_TOKEN`，值填刚复制的 token
-
-未配置时这一步会静默跳过，不影响签到本身。
-
-**为什么不依赖 GitHub 自带的邮件通知**：它对 `schedule` 触发有额外限制（只通知 workflow
-文件的最后修改者），而且很容易被邮箱网关当成垃圾邮件拦掉。微信推送更直接。
-
-**注意**：PushPlus 可能要求实名认证，不想认证的话删掉 `PUSHPLUS_TOKEN` 即可。那一步本质
-上就是 `curl` 发一个 JSON POST，换成任何接受 JSON 的 webhook 服务都能用。
-
 ## 排查指南
 
-看 Actions 日志里最后那段 `ERROR:`，它直接给出结论和修复方式。
+看 Actions 日志里最后那段 `ERROR:`，它直接给出结论和修复方式。失败时运行页面上还会有一份
+`Summary`（由 `$GITHUB_STEP_SUMMARY` 写成），不用展开日志就能看到退出码和对应处理方式。
+
+**关于失败通知**：GitHub 会发邮件 —— 手动触发的发给触发者，`schedule` 触发的发给 workflow
+文件的最后修改者。**没收到邮件先查垃圾邮件箱**：163 等邮箱经常把 `notifications@github.com`
+判成垃圾邮件，建议把它和 `noreply@github.com` 一起加进白名单。
 
 | 日志关键字 | 含义 | 处理 |
 | --- | --- | --- |

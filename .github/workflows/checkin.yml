@@ -68,37 +68,6 @@ jobs:
           GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
         run: python checkin.py
 
-      # 微信推送失败提醒。必须排在 Report failure 之前 —— 后者会 exit 1，
-      # 而 GitHub 在 step 失败后默认跳过后续步骤，放后面就永远不会执行。
-      # 未配置 PUSHPLUS_TOKEN 时静默跳过，不引入新的失败点。
-      - name: Push WeChat notification on failure
-        if: steps.first_checkin.outcome == 'failure'
-        env:
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: |
-          if [ -z "$PUSHPLUS_TOKEN" ]; then
-            echo "未配置 PUSHPLUS_TOKEN，跳过微信推送"
-            exit 0
-          fi
-
-          code="${{ steps.first_checkin.outputs.exit_code }}"
-          if [ "$code" = "1" ]; then
-            reason="不可重试错误（token / cookie / 响应结构），重试同一配置不会成功"
-          elif [ "$code" = "2" ]; then
-            reason="网络或服务端临时故障，已等待 60 秒重试仍失败"
-          else
-            reason="未知错误"
-          fi
-
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          content="<b>退出码：</b>${code}<br><b>原因：</b>${reason}<br><br><a href='${run_url}'>点击查看运行日志</a><br><br>若提示 Cookie 已失效或没有权限，请重新登录 glados.cloud 并更新仓库 Secret GLADOS_COOKIE。"
-
-          response=$(curl -sS -X POST "https://www.pushplus.plus/send" \
-            -H "Content-Type: application/json" \
-            -d "{\"token\":\"${PUSHPLUS_TOKEN}\",\"title\":\"GLaDOS 签到失败\",\"content\":\"${content}\",\"template\":\"html\"}" \
-            2>&1) || true
-          echo "PushPlus 响应: $response"
-
       # 条件只看首次结果。不可重试错误（exit 1）时重试步骤是 skipped，
       # 若把 retry_checkin 也写进条件，这里就不会执行，而 Run checkin script
       # 带 continue-on-error，整个 job 会错误地显示成功。
