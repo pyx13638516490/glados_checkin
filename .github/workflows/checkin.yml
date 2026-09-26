@@ -9,7 +9,7 @@ on:
     - cron: '47 7 * * *'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: glados-checkin
@@ -42,8 +42,8 @@ jobs:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
         run: |
-          python checkin.py
-          code=$?
+          python checkin.py 2>&1 | tee /tmp/checkin_output.txt
+          code=${PIPESTATUS[0]}
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit $code
 
@@ -62,6 +62,30 @@ jobs:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
         run: python checkin.py
+
+      # 临时诊断通道：GitHub 现在要求登录才能查看 Actions 日志，
+      # 失败时把脚本原始输出提交回仓库，这样排查不需要交换任何凭证。
+      # 邮箱已脱敏；脚本本身从不打印 Cookie。
+      # 问题定位后应删掉这一步和 .diagnostics/ 目录。
+      - name: Publish failure diagnostics
+        if: steps.first_checkin.outcome == 'failure'
+        run: |
+          mkdir -p .diagnostics
+          {
+            echo "run_number=${{ github.run_number }}"
+            echo "sha=${{ github.sha }}"
+            echo "exit_code=${{ steps.first_checkin.outputs.exit_code }}"
+            echo "time_utc=$(date -u +%FT%TZ)"
+            echo "--- script output ---"
+            sed -E 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<email-redacted>/g' \
+              /tmp/checkin_output.txt
+          } > .diagnostics/last-failure.txt
+          cat .diagnostics/last-failure.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f .diagnostics/last-failure.txt
+          git diff --cached --quiet || git commit -m "chore: record checkin failure diagnostics"
+          git push || echo "诊断推送失败（不影响失败结论）"
 
       - name: Report failure
         if: steps.first_checkin.outcome == 'failure'

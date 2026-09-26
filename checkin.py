@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -88,6 +89,11 @@ def require_cookie():
         )
     if "koa:sess" not in cookie or "koa:sess.sig" not in cookie:
         log("WARNING: GLADOS_COOKIE 里没有同时出现 koa:sess 和 koa:sess.sig。")
+    # 只输出长度和指纹，便于排查 cookie 是否为空/被截断，不泄露 cookie 本身
+    log(
+        f"Cookie 长度 {len(cookie)}，"
+        f"sha256 指纹 {hashlib.sha256(cookie.encode()).hexdigest()[:12]}"
+    )
     return cookie
 
 
