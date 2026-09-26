@@ -18,7 +18,7 @@ concurrency:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -41,21 +41,16 @@ jobs:
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
-        run: |
-          python checkin.py
-          code=$?
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit $code
+        run: python checkin.py
 
-      # 退出码 2 = 网络或服务端临时故障，重试有意义。
-      # 退出码 1 = token / cookie / 响应结构问题，重试必然同样失败。
-      - name: Wait 60s before retry
-        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
-        run: sleep 60
+      # Use the original outcome: continue-on-error changes conclusion to success.
+      - name: Wait 5 minutes before retry
+        if: steps.first_checkin.outcome == 'failure'
+        run: sleep 300
 
       - name: Retry checkin script
         id: retry_checkin
-        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
+        if: steps.first_checkin.outcome == 'failure'
         continue-on-error: true
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
@@ -63,12 +58,14 @@ jobs:
         run: python checkin.py
 
       - name: Report failure
-        if: steps.first_checkin.outcome == 'failure'
+        if: steps.first_checkin.outcome == 'failure' && steps.retry_checkin.outcome == 'failure'
         run: |
-          if [ "${{ steps.first_checkin.outputs.exit_code }}" = "1" ]; then
-            echo "签到失败，且属于不可重试错误（token / cookie / 响应结构）。"
-            echo "请展开上方 Run checkin script 步骤，按 ERROR 提示修复。"
-          else
-            echo "签到在重试后仍然失败（临时故障或服务端不可用）。"
-          fi
+          echo "::error::签到和 5 分钟后的重试均失败。请查看两次签到步骤中的 ERROR。"
+          {
+            echo "### 签到失败"
+            echo "首次签到和等待 5 分钟后的重试均失败。"
+            echo "请查看 Run checkin script 和 Retry checkin script 的 ERROR 日志。"
+            echo "若提示 Cookie 已失效或没有权限，请重新登录 glados.cloud 并更新仓库 Secret GLADOS_COOKIE。"
+            echo "此任务以失败结束，供 GitHub Actions 原生通知报告。"
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1
