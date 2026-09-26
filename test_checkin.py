@@ -75,6 +75,32 @@ def test_classify():
         print(f"  PASS 分类: {name} -> {got}")
 
 
+def test_redact():
+    payload = {
+        "code": 0,
+        "data": {
+            "email": "someone@example.com",
+            "password": "abcd",
+            "code": "c58790e",
+            "domain": "0a36447",
+            "port": 183876,
+            "leftDays": "426",
+            "userId": 455278,
+        },
+        "points": "385",
+        "history": [{"user_id": 455278, "change": "9", "balance": "385"}],
+    }
+    out = c.redact(payload)
+    for key in ("email", "password", "code", "domain", "port", "userId"):
+        assert out["data"][key] == "<redacted>", f"{key} 必须脱敏"
+    assert out["data"]["leftDays"] == "426", "leftDays 是诊断字段，必须保留"
+    assert out["points"] == "385", "points 必须保留"
+    assert out["history"][0]["change"] == "9", "积分变化必须保留"
+    assert out["history"][0]["user_id"] == "<redacted>", "嵌套 user_id 必须脱敏"
+    assert payload["data"]["email"] == "someone@example.com", "不应修改原始响应"
+    print("  PASS 脱敏: 账号与订阅字段被隐藏，诊断字段保留")
+
+
 def test_get_env():
     os.environ["T_EMPTY"] = "   "
     os.environ["T_VAL"] = " x "
@@ -177,6 +203,7 @@ def test_server_error_is_marked_retryable():
 def main():
     print("单元测试:")
     test_classify()
+    test_redact()
     test_get_env()
     test_resolve_token()
     test_candidate_urls()

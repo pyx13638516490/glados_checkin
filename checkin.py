@@ -53,6 +53,26 @@ AUTH_ERROR_MARKERS = (
     "登录已过期",
 )
 
+# 响应里这些字段会被写进 CI 日志。其中 code / domain / port 组合起来足以
+# 还原订阅信息，email / password / hashed 属于账号信息，因此统一脱敏。
+SENSITIVE_KEYS = frozenset(
+    {
+        "email",
+        "password",
+        "hashed",
+        "code",
+        "domain",
+        "port",
+        "phone",
+        "usdt_address",
+        "telegram_id",
+        "configureid",
+        "configure_id",
+        "user_id",
+        "userid",
+    }
+)
+
 
 class FatalError(RuntimeError):
     """重试也不会成功的错误。"""
@@ -175,7 +195,10 @@ def request_json(session, method, url, origin, payload=None):
                     data=json.dumps(payload),
                 )
             body = parse_json_response(response)
-            log(f"HTTP {response.status_code}: {json.dumps(body, ensure_ascii=False)}")
+            log(
+                f"HTTP {response.status_code}: "
+                f"{json.dumps(redact(body), ensure_ascii=False)}"
+            )
 
             if response.status_code in (401, 403):
                 raise FatalError(
@@ -204,6 +227,22 @@ def request_json(session, method, url, origin, payload=None):
             time.sleep(sleep_seconds)
 
     raise RetryableError(f"{MAX_ATTEMPTS} 次尝试后仍失败: {last_error}")
+
+
+def redact(payload):
+    """隐藏响应中的账号与订阅敏感字段，避免泄露到 CI 日志。
+
+    这些日志可能被仓库协作者看到，排查时也常被整段贴到别处，
+    所以默认就不打印敏感字段。
+    """
+    if isinstance(payload, dict):
+        return {
+            key: ("<redacted>" if key.lower() in SENSITIVE_KEYS else redact(value))
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [redact(item) for item in payload]
+    return payload
 
 
 def response_text(payload):
