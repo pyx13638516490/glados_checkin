@@ -104,6 +104,14 @@ python test_checkin.py
 | `读取 status 失败` / `读取 points 失败` | 只影响信息展示，签到结论仍然有效 | 可忽略，除非持续出现 |
 | `可重试的 HTTP 状态` | 服务端 5xx 或限流 | 无需处理，workflow 会自动重试一次 |
 
+> **Cookie 失效时的响应是 `HTTP 200` + `{"code":-2,"message":"没有权限"}`。**
+> 它既不是 401/403，也不是 Cloudflare 拦截，所以极容易被误读成"站点加了反脚本检测"。
+> 看到它只需要重新登录复制 Cookie，不必改任何代码。
+>
+> 另一种同样容易误读的情况是 token 过期：也是 `HTTP 200`，只是 message 变成
+> `please checkin via https://glados.cloud`。两者的共同点是**接口返回 200，
+> 但签到实际没有生效** —— 这正是为什么脚本必须校验响应内容，而不能只看状态码。
+
 判断签到是否真的生效，看 `Current points` 那一行有没有增加，**不要看 `leftDays`**。
 
 ## Cookie 获取
