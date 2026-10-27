@@ -92,6 +92,47 @@ python test_checkin.py
 | `GLADOS_CHECKIN_TOKEN` | `glados.cloud` | 签到 token，一般不需要改 |
 | `GLADOS_BASE_URL` | `https://glados.cloud` | 主域名 |
 | `GLADOS_DOMAIN_FALLBACK` | `1` | 设 `0` 关闭 `rocks` / `network` 域名回退 |
+
+## 每月更新 cookie
+
+cookie 的有效期是 **30 天**（`koa:sess` 的 `_maxAge` 硬限制），到期后签到返回
+`没有权限`、退出码为 `1`。服务端不会在调用时刷新 cookie（实测 `status` / `points`
+都没有 `Set-Cookie`），而登录走邮箱验证码——所以**没有任何自动续期的办法，必须周期更新**。
+
+> 拖到第 31 天才换会断签（`STREAK` 会清零）。建议提前几天，比如设个 25 天后的提醒。
+
+### 手动方式（约 30 秒）
+
+1. 登录 https://glados.cloud → `F12` → **Application** → **Cookies** → 选 `https://glados.cloud`
+2. 复制四个值：`koa:sess`、`koa:sess.sig`、`gld:sess`、`gld:sess.sig`
+3. 拼成一行（分号后一个空格）：
+   ```
+   koa:sess=…; koa:sess.sig=…; gld:sess=…; gld:sess.sig=…
+   ```
+4. 更新仓库 Secret `GLADOS_COOKIE`
+
+### 一键方式（约 5 秒）
+
+需要一次性配置 fine-grained PAT：
+
+1. GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
+2. **Repository access** 只勾 `pyx13638516490/glados_checkin`
+3. **Permissions → Repository permissions → Secrets: Read and write**
+4. 生成后立刻复制（只显示一次）
+
+之后每次更新：
+
+```powershell
+pip install pynacl            # 只需第一次
+$env:GH_PAT = 'github_pat_xxx'
+python tools/update_secret.py
+```
+
+脚本从**剪贴板**读取刚复制的 cookie，用仓库公钥加密后写入 Secret。cookie 不落盘、
+不打印，也不会留在 shell 历史里。
+
+> `tools/update_secret.py` 也支持改目标：`$env:REPO`、`$env:SECRET_NAME`。
+
 ## 排查指南
 
 看 Actions 日志里最后那段 `ERROR:`，它直接给出结论和修复方式。失败时运行页面上还会有一份
