@@ -2,6 +2,8 @@ name: GLaDOS Checkin
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]   # 临时：用于验证 CI 链路，验证后移除
   schedule:
     # GitHub 使用 UTC。下面对应北京时间 09:17 与 15:47。
     # 避开整点：高峰时段计划任务可能被延迟甚至丢弃。
