@@ -149,6 +149,7 @@ python tools/update_secret.py
 | `签到响应无法识别` | API 可能又变了，或返回了未适配的新文案 | 对照控制台积分确认，把日志里的响应内容提 Issue |
 | `读取 status 失败` / `读取 points 失败` | 只影响信息展示，签到结论仍然有效 | 可忽略，除非持续出现 |
 | `可重试的 HTTP 状态` | 服务端 5xx 或限流 | 无需处理，workflow 会自动重试一次 |
+| `带 cookie 请求超时` / Cloudflare `502` | **源站认证链路故障**，不是 cookie 失效 | 做「无 cookie 对照」（见下），两边表现一致就等站点恢复 |
 
 > **Cookie 失效时的响应是 `HTTP 200` + `{"code":-2,"message":"没有权限"}`。**
 > 它既不是 401/403，也不是 Cloudflare 拦截，所以极容易被误读成"站点加了反脚本检测"。
@@ -159,6 +160,29 @@ python tools/update_secret.py
 > 但签到实际没有生效** —— 这正是为什么脚本必须校验响应内容，而不能只看状态码。
 
 判断签到是否真的生效，看 `Current points` 那一行有没有增加，**不要看 `leftDays`**。
+
+### 区分「服务端故障」与「cookie 失效」
+
+服务端出故障时，表现和 cookie 失效**几乎一样**：页面转圈、`Days Left: NaN`、积分显示 0、
+签到返回"没有权限"。区别靠一个对照实验，只要 30 秒：
+
+```python
+# 同一个接口，唯一变量是带不带 cookie
+GET /api/user/points                      # 不带 cookie
+GET /api/user/points  (Cookie: koa:sess=…)  # 带 cookie
+```
+
+| 现象 | 结论 |
+| --- | --- |
+| 不带 cookie 秒回 `{"code":-2,…}`，带 cookie 也秒回 `{"code":-2,…}` | **cookie 真的失效了** → 重新登录取新 cookie |
+| 不带 cookie 秒回，带 cookie **超时 / 502 / 500** | **源站认证链路故障** → cookie 大概率是好的，等恢复 |
+
+2026-11-01 实测过一次这个故障：HTML 和 `service-status` 正常，
+但 `status` / `points` / `checkin` 一旦带 cookie 就 20 秒后 502 或超时；
+连**伪造的乱码 cookie** 也超时——源码在进账号校验之前就卡住了，所以与具体账号无关。
+
+> 这个故障期间 GitHub Actions 会以 `exit 1` 结束（服务端错误地返回"没有权限"），
+> 很容易被误读成 token/cookie 过期。**先做对照实验，再决定要不要换 cookie。**
 
 ## Cookie 获取
 
