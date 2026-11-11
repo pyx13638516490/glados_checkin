@@ -66,7 +66,11 @@ jobs:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'fail_only' }}
+          # 默认改成 all：每天都推一条，里面带当前积分和最近一次变化量。
+          # 这样"签到成功了但没给分"这种静默失败也能看出来——那正是
+          # 2026-11-03~11-10 连续 8 天的情况，CI 全绿却一分没进。
+          # 只想在失败时收消息的话，配仓库 Variable PUSH_LEVEL=fail_only。
+          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'all' }}
           EXCHANGE_PLAN: ${{ vars.EXCHANGE_PLAN || 'plan500' }}
           CHECKIN_MAX_ATTEMPTS: '3'
           CHECKIN_RETRY_DELAY_SECONDS: '60'
