@@ -38,10 +38,15 @@ DOMAINS = [
     "https://glados.network",
 ]
 
+# 新版签到会校验会话绑定的浏览器，UA 不一致会返回 device-mismatch 或
+# "Automated check-in detected"。下面这个默认值取自 2026-11-11 生成当前
+# 会话的 Edge profile（chrome://version 的「用户代理」）。
+# 换浏览器或大版本升级后，应改用仓库 Variable GLADOS_USER_AGENT 覆盖，
+# 而不是改这里。
 DEFAULT_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
     'AppleWebKit/537.36 (KHTML, like Gecko) '
-    'Chrome/120.0.0.0 Safari/537.36'
+    'Chrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0'
 )
 
 HEADERS = {

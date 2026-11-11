@@ -58,11 +58,9 @@ jobs:
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           # 必须与生成当前会话的浏览器一致，否则签到会被 device-mismatch 拒绝。
-          # 优先级：仓库 Variable > 同名 Secret > 下面的内置默认值。
-          # 默认值取自 2026-11-11 生成当前 cookie 的 Edge profile
-          # （chrome://version 的「用户代理」）。浏览器大版本升级后需要更新这一行，
-          # 或者改用 Variable 覆盖，免得改代码。
-          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0' }}
+          # 优先读仓库 Variable，兼容同名 Secret；两者都为空时用 checkin.py
+          # 内置的默认 UA（已按当前登录的 Edge 生成）。
+          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
           CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
