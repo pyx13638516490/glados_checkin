@@ -40,6 +40,44 @@ GLaDOS 在 2026 年初更新了签到接口，**签到 token 从 `glados.one` �
 6. **收紧认证判定**：旧脚本用 `"login"`、`"cookie"` 这类宽泛关键词匹配，容易把正常响应误判为认证失败。
 7. **空环境变量不再覆盖默认值**：GitHub 上定义了但留空的变量会被当作"未设置"。
 
+## 2026-11 签到只给 1 分：缺了挑战流程
+
+2026-11-05 起，只提交 `{"token": ...}` 的旧签到流程仍然返回成功，
+但服务端只给 **1 分**（手动签到正常给 9～18 分）。
+
+官方控制台实际发的是三步：
+
+```text
+GET  /api/user/checkin/challenge   -> {"code":0, "nonce":"...", "ttl":300000}
+proof = sha256(nonce + ".glados-observe-v1")
+等待 >= 2.5 秒（本脚本用 2.7 秒留余量）
+POST /api/user/checkin  {"token": ..., "nonce": ..., "proof": ...}
+```
+
+要点：
+
+- 挑战**绑定签发它的域名**，必须回原域名提交，不能换域名
+- 超过 `ttl` 就不要提交，宁可失败重领
+- 领不到挑战时**不提交**签到——提交了只会拿 1 分，还会占掉当天名额
+
+本脚本已按上述流程实现。`checkin.py` 里没有这一步时，看积分流水会发现
+每天只有 `change=1`。
+
+> 服务端决定最终入账积分。拿到 `Checkin! Got 1 Points` 且流水 +1，
+> 说明签到成功了、只是这次奖励低，**不要当成网络失败反复补签**。
+
+### 设备校验：`device-mismatch` / `Automated check-in detected`
+
+新版签到还会校验会话绑定的浏览器。用脚本默认 UA 可能被拒，此时把生成
+cookie 的那个浏览器的 UA 配进来：
+
+1. 浏览器打开 `chrome://version`，复制「用户代理」整行
+2. 仓库 `Settings → Secrets and variables → Actions → Variables`
+   → `New repository variable`，名称 `GLADOS_USER_AGENT`，值是刚才那行
+3. 重新登录一次 glados.cloud，同步更新 `GLADOS_COOKIE`
+
+脚本日志里只显示「User-Agent 来源: GLADOS_USER_AGENT / 默认值」，不打印 UA 本身。
+
 ## 目录结构
 
 ```text
@@ -90,6 +128,7 @@ python test_checkin.py
 | --- | --- | --- |
 | `GLADOS_COOKIE` | 无（必需） | 完整 Cookie 字符串 |
 | `GLADOS_CHECKIN_TOKEN` | `glados.cloud` | 签到 token，一般不需要改 |
+| `GLADOS_USER_AGENT` | 内置 Chrome UA | 生成该 cookie 的浏览器 UA，用于设备校验 |
 | `GLADOS_BASE_URL` | `https://glados.cloud` | 主域名 |
 | `GLADOS_DOMAIN_FALLBACK` | `1` | 设 `0` 关闭 `rocks` / `network` 域名回退 |
 

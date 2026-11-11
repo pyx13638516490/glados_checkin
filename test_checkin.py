@@ -25,12 +25,22 @@ class FakeResponse:
             raise c.requests.HTTPError(f"HTTP {self.status_code}")
 
 
-def run_main(routes, status_code=200):
-    """把 HTTP 层换成假实现跑一遍 main()，返回 (退出码, 实际请求过的 URL)。"""
+def run_main(routes, status_code=200, challenge=None):
+    """把 HTTP 层换成假实现跑一遍 main()，返回 (退出码, 实际请求过的 URL)。
+
+    2026-11 起签到前要先领挑战，所以默认先给一个可用的挑战路由；
+    需要测试挑战失败时用 challenge= 覆盖。
+    """
     seen = []
+
+    if challenge is None:
+        challenge = {"code": 0, "nonce": "n" * 64, "ttl": 300000}
 
     def fake_request(method, url, timeout=None, headers=None, data=None):
         seen.append(url)
+        # 挑战路由必须排在前面，否则会被 "/api/user/checkin" 抢先匹配
+        if "/api/user/checkin/challenge" in url:
+            return FakeResponse(200, challenge)
         for fragment, payload in routes:
             if fragment in url:
                 return FakeResponse(status_code, payload)
@@ -68,6 +78,8 @@ def test_classify():
         ("cookie 失效(中文-未登录)", {"code": -2, "message": "未登录"}, "auth_error"),
         ("不认识的响应", {"code": 9, "message": "Something new"}, "unknown"),
         ("非 JSON 响应", {"code": None, "message": "Non-JSON response", "text": "<html>"}, "unknown"),
+        ("设备不匹配", {"code": -2, "message": "device-mismatch"}, "device_error"),
+        ("被判定为自动化", {"code": -2, "message": "Automated check-in detected"}, "device_error"),
     ]
     for name, payload, want in cases:
         got = c.classify_checkin(payload)
@@ -186,7 +198,8 @@ def test_auth_error_stops_immediately():
         ("/api/user/checkin", {"code": -1, "message": "Not logged in"}),
     ])
     assert code == c.EXIT_FATAL, code
-    assert len(seen) == 1, f"认证失败不该重试, 实际请求 {seen}"
+    checkin_calls = [u for u in seen if u.endswith("/api/user/checkin")]
+    assert len(checkin_calls) == 1, f"认证失败不该重试签到, 实际请求 {seen}"
     print("  PASS 流程: cookie 失效 -> 立即失败，不做无意义重试")
 
 
@@ -196,8 +209,73 @@ def test_server_error_is_marked_retryable():
         status_code=503,
     )
     assert code == c.EXIT_RETRYABLE, f"5xx 应标记为可重试, got {code}"
-    assert len(seen) == c.MAX_ATTEMPTS, f"应重试 {c.MAX_ATTEMPTS} 次, 实际 {len(seen)}"
+    checkin_calls = [u for u in seen if u.endswith("/api/user/checkin")]
+    assert len(checkin_calls) == c.MAX_ATTEMPTS, (
+        f"应重试 {c.MAX_ATTEMPTS} 次签到, 实际 {len(checkin_calls)}"
+    )
     print("  PASS 流程: 服务端 5xx -> 退出码 2（workflow 会重试）")
+
+
+# --- 挑战流程（2026-11 起，缺了它只能拿 1 分）-----------------------------
+
+def test_checkin_posts_nonce_and_proof():
+    """签到请求必须带 nonce + SHA-256 proof，且在同一域名提交。"""
+    import hashlib
+
+    captured = {}
+
+    def fake_request(method, url, timeout=None, headers=None, data=None):
+        if "/api/user/checkin/challenge" in url:
+            return FakeResponse(200, {"code": 0, "nonce": "abc", "ttl": 600000})
+        captured["url"] = url
+        captured["payload"] = json.loads(data)
+        return FakeResponse(200, {"code": 0, "message": "Checkin! Got 12 Points"})
+
+    session = c.build_session("koa:sess=a; koa:sess.sig=b")
+    with mock.patch.object(c.requests.Session, "request", side_effect=fake_request), \
+            mock.patch.object(c.time, "sleep", return_value=None):
+        base, payload = c.do_checkin(session, ["https://glados.cloud"], "glados.cloud")
+
+    assert base == "https://glados.cloud"
+    assert captured["url"] == "https://glados.cloud/api/user/checkin"
+    assert captured["payload"]["nonce"] == "abc"
+    assert captured["payload"]["token"] == "glados.cloud"
+    assert captured["payload"]["proof"] == hashlib.sha256(
+        b"abc.glados-observe-v1"
+    ).hexdigest(), "proof 算法必须与官网一致"
+    print("  PASS 挑战: 提交 nonce + proof，且回原域名提交")
+
+
+def test_challenge_failure_blocks_checkin():
+    """领不到挑战就不要提交签到 —— 旧流程提交只会拿 1 分。"""
+    code, seen = run_main([], challenge={"code": -1, "message": "challenge unavailable"})
+    checkin_calls = [u for u in seen if u.endswith("/api/user/checkin")]
+    assert not checkin_calls, f"挑战失败后不应提交签到, 实际 {seen}"
+    assert code == c.EXIT_RETRYABLE, code
+    print("  PASS 挑战: 领取失败 -> 不提交签到，退出码 2")
+
+
+def test_expired_challenge_blocks_checkin():
+    """ttl 太短的挑战不能提交，否则服务端会拒绝。"""
+    code, seen = run_main(
+        [], challenge={"code": 0, "nonce": "n" * 64, "ttl": 1000}
+    )
+    checkin_calls = [u for u in seen if u.endswith("/api/user/checkin")]
+    assert not checkin_calls, f"过期挑战不应提交, 实际 {seen}"
+    assert code == c.EXIT_RETRYABLE, code
+    print("  PASS 挑战: ttl 过短 -> 不提交签到，退出码 2")
+
+
+def test_device_mismatch_is_fatal_with_ua_hint():
+    code, _ = run_main([
+        ("/api/user/checkin", {"code": -2, "message": "device-mismatch"}),
+    ])
+    assert code == c.EXIT_FATAL, code
+    text = c.explain_failure(
+        "device_error", {"message": "device-mismatch"}, "glados.cloud", "https://glados.cloud"
+    )
+    assert "GLADOS_USER_AGENT" in text, "应提示配置 User-Agent"
+    print("  PASS 流程: 设备校验被拒 -> 退出码 1，并提示配 User-Agent")
 
 
 def main():
@@ -214,6 +292,11 @@ def main():
     test_unknown_response_is_not_reported_as_success()
     test_auth_error_stops_immediately()
     test_server_error_is_marked_retryable()
+    print("挑战流程测试:")
+    test_checkin_posts_nonce_and_proof()
+    test_challenge_failure_blocks_checkin()
+    test_expired_challenge_blocks_checkin()
+    test_device_mismatch_is_fatal_with_ua_hint()
     print("\nALL PASS")
     return 0
 

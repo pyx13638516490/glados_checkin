@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import requests
 
@@ -22,6 +23,29 @@ FALLBACK_BASE_URLS = ("https://glados.rocks", "https://glados.network")
 
 TIMEOUT = (10, 30)
 MAX_ATTEMPTS = 3
+
+# --- 2026-11 签到挑战（1 积分问题）---------------------------------------
+# 2026-11-06 起，官方控制台签到前会先 GET 一个一次性挑战，等待后提交
+# nonce + proof。只提交 token 的旧流程仍然能"签到成功"，但服务端只给 1 分。
+#
+#   GET  /api/user/checkin/challenge  -> {"code":0,"nonce":"...","ttl":300000}
+#   proof = sha256(nonce + ".glados-observe-v1")
+#   等待 >= 2.5 秒（这里用 2.7 秒留余量）
+#   POST /api/user/checkin {"token":..., "nonce":..., "proof":...}
+#
+# 挑战绑定签发它的域名，必须回原域名提交；过期（超过 ttl）就不要提交。
+CHALLENGE_PATH = "/api/user/checkin/challenge"
+PROOF_SUFFIX = ".glados-observe-v1"
+CHALLENGE_DELAY_SECONDS = 2.7
+
+# 新版签到还会校验会话绑定的浏览器。用默认 UA 可能触发 device-mismatch
+# 或 "Automated check-in detected"，此时应把 GLADOS_USER_AGENT 设为生成
+# 该 cookie 的浏览器 UA。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.0.0 Safari/537.36"
+)
 
 # 退出码约定，供 workflow 判断是否值得重试
 EXIT_OK = 0
@@ -51,6 +75,14 @@ AUTH_ERROR_MARKERS = (
     "未登录",
     "请先登录",
     "登录已过期",
+)
+# 设备/自动化校验被拒：和 cookie 失效不同，重新取 cookie 也没用，
+# 需要让 GLADOS_USER_AGENT 与生成会话的浏览器一致。
+DEVICE_ERROR_MARKERS = (
+    "device-mismatch",
+    "device mismatch",
+    "automated check-in detected",
+    "automated checkin detected",
 )
 
 # 响应里这些字段会被写进 CI 日志。其中 code / domain / port 组合起来足以
@@ -141,20 +173,64 @@ def candidate_base_urls():
     return urls
 
 
+def resolve_user_agent():
+    """读取浏览器 UA。新版签到会校验会话绑定的设备，默认值可能被拒。
+
+    这里不打印 UA 本身（它属于设备指纹），只说明配置来源。
+    """
+    raw = get_env("GLADOS_USER_AGENT")
+    if not raw:
+        return DEFAULT_USER_AGENT, "默认值"
+    # 容错：粘贴时可能带上 "User-Agent:" 前缀或整对引号
+    value = raw.strip()
+    if value.lower().startswith("user-agent:"):
+        value = value[len("user-agent:"):].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value or DEFAULT_USER_AGENT, "GLADOS_USER_AGENT"
+
+
+def browser_hint_headers(user_agent):
+    """按 UA 补 Sec-CH-UA 系列，与 Chrome 实际请求一致。"""
+    headers = {}
+    chrome = None
+    for token in user_agent.split():
+        if token.startswith("Chrome/") or token.startswith("Chromium/"):
+            chrome = token.split("/", 1)[1].split(".")[0]
+            break
+    if chrome and chrome.isdigit():
+        headers["Sec-CH-UA"] = (
+            f'"Chromium";v="{chrome}", "Google Chrome";v="{chrome}", '
+            '"Not_A Brand";v="99"'
+        )
+        headers["Sec-CH-UA-Mobile"] = "?1" if "Mobile" in user_agent else "?0"
+        if "Windows" in user_agent:
+            platform = "Windows"
+        elif "Macintosh" in user_agent:
+            platform = "macOS"
+        elif "Android" in user_agent:
+            platform = "Android"
+        elif "Linux" in user_agent:
+            platform = "Linux"
+        else:
+            platform = "Unknown"
+        headers["Sec-CH-UA-Platform"] = f'"{platform}"'
+    return headers
+
+
 def build_session(cookie):
+    user_agent, source = resolve_user_agent()
+    log(f"浏览器 User-Agent 来源: {source}")
     session = requests.Session()
     session.headers.update(
         {
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json;charset=UTF-8",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0 Safari/537.36"
-            ),
+            "User-Agent": user_agent,
             "Cookie": cookie,
         }
     )
+    session.headers.update(browser_hint_headers(user_agent))
     return session
 
 
@@ -272,6 +348,8 @@ def classify_checkin(payload):
 
     if any(marker in text for marker in TOKEN_ERROR_MARKERS):
         return "token_error"
+    if any(marker in text for marker in DEVICE_ERROR_MARKERS):
+        return "device_error"
     if any(marker in text for marker in AUTH_ERROR_MARKERS):
         return "auth_error"
     if any(marker in text for marker in SUCCESS_MARKERS):
@@ -301,6 +379,15 @@ def explain_failure(status, payload, token, base_url):
             "koa:sess.sig，更新 GitHub Secret GLADOS_COOKIE。\n"
             f"  接口返回: {message!r}"
         )
+    if status == "device_error":
+        return (
+            "服务端拒绝了设备/自动化校验。这不是 cookie 过期，重新取 cookie "
+            "通常也没用。\n"
+            f"  接口返回: {message!r}\n"
+            "  修复: 打开生成该 cookie 的浏览器的 chrome://version，"
+            "复制完整「用户代理」，\n"
+            "  配到仓库 Variables 的 GLADOS_USER_AGENT，然后重新登录一次并同步更新 cookie。"
+        )
     return (
         "签到响应无法识别，不能确认签到是否生效。\n"
         f"  {base_url}/api/user/checkin 返回: {message!r}\n"
@@ -316,27 +403,90 @@ def left_days_from_status(payload):
     return None
 
 
+def token_for(base_url, token):
+    """签到 token 通常等于当前域名；显式配置的自定义值优先。"""
+    if token and token != DEFAULT_CHECKIN_TOKEN:
+        return token
+    return urlsplit(base_url).hostname or DEFAULT_CHECKIN_TOKEN
+
+
+def request_challenge(session, base_url, token):
+    """领取一次性签到挑战，返回 (nonce, ttl_ms)。
+
+    这一步不提交任何签到动作：只读接口，失败时不影响当天签到状态。
+    """
+    payload = request_json(
+        session, "get", f"{base_url}{CHALLENGE_PATH}", base_url
+    )
+
+    # 挑战接口同样会做认证，认证失败就没必要继续
+    status = classify_checkin(payload)
+    if status in ("token_error", "auth_error", "device_error"):
+        raise FatalError(explain_failure(status, payload, token, base_url))
+
+    if not isinstance(payload, dict):
+        raise RetryableError(f"挑战响应格式异常: {payload!r}")
+
+    nonce = payload.get("nonce")
+    ttl = payload.get("ttl", 300000)
+    if payload.get("code") != 0 or not isinstance(nonce, str) or not nonce:
+        raise RetryableError(
+            f"未领取到有效挑战（code={payload.get('code')!r}），接口可能又变了"
+        )
+    if not isinstance(ttl, (int, float)) or ttl <= CHALLENGE_DELAY_SECONDS * 1000:
+        raise RetryableError(f"挑战有效期异常 ttl={ttl!r}")
+    return nonce, ttl
+
+
 def do_checkin(session, base_urls, token):
-    """在候选域名上执行签到，返回 (base_url, payload)。"""
+    """在候选域名上执行签到，返回 (base_url, payload)。
+
+    新版流程：领挑战 -> 等 2.5 秒以上 -> 提交 nonce/proof。
+    挑战绑定签发域名，必须在同一域名提交，所以换域名时要重新领一次。
+    """
     last_error = None
 
     for base_url in base_urls:
+        try:
+            nonce, ttl = request_challenge(session, base_url, token)
+        except RetryableError as exc:
+            last_error = exc
+            log(f"{base_url} 领取签到挑战失败: {exc}")
+            continue
+
+        proof = hashlib.sha256(
+            (nonce + PROOF_SUFFIX).encode("utf-8")
+        ).hexdigest()
+        log(f"已领取签到挑战，等待 {CHALLENGE_DELAY_SECONDS}s 后提交")
+
+        started = time.monotonic()
+        time.sleep(CHALLENGE_DELAY_SECONDS)
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if elapsed_ms >= ttl:
+            last_error = RetryableError(f"挑战已过期（已等待 {elapsed_ms:.0f}ms，ttl={ttl}）")
+            log(str(last_error))
+            continue
+
         try:
             payload = request_json(
                 session,
                 "post",
                 f"{base_url}/api/user/checkin",
                 base_url,
-                payload={"token": token},
+                payload={
+                    "token": token_for(base_url, token),
+                    "nonce": nonce,
+                    "proof": proof,
+                },
             )
         except RetryableError as exc:
             last_error = exc
-            log(f"{base_url} 不可用: {exc}")
+            log(f"{base_url} 提交签到失败: {exc}")
             continue
 
         status = classify_checkin(payload)
-        if status in ("token_error", "auth_error"):
-            # token / cookie 问题和域名无关，换域名没有意义
+        if status in ("token_error", "auth_error", "device_error"):
+            # 认证 / 设备问题和域名无关，换域名没有意义
             raise FatalError(explain_failure(status, payload, token, base_url))
         return base_url, payload
 
