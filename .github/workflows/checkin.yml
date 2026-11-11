@@ -1,101 +1,71 @@
-name: GLaDOS Checkin
+name: GLaDOS 2026 Checkin
 
 on:
-  workflow_dispatch:
   schedule:
-    # GitHub 使用 UTC。下面对应北京时间 09:17 与 15:47。
-    # 避开整点：高峰时段计划任务可能被延迟甚至丢弃。
+    # 北京时间 09:17 与 15:47。一天两次是有意为之：
+    # GitHub 的 schedule 经常延迟（实测约 6 小时），偶尔直接丢弃，
+    # 两次能显著降低"当天没签到"的概率。签到是幂等的，重复运行无害。
     - cron: '17 1 * * *'
     - cron: '47 7 * * *'
-
-permissions:
-  contents: read
+  workflow_dispatch:
+    inputs:
+      dispatch_source:
+        description: 手动运行请选择 manual；外部定时器可不填（默认按 external）
+        required: false
+        default: external
+        type: choice
+        options:
+          - manual
+          - external
+      diagnose_only:
+        description: 只检查 Cookie 是否可读取账号状态，不签到、不兑换、不推送
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: glados-checkin
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   checkin:
+    if: github.event_name == 'schedule' || inputs.dispatch_source == 'manual' || inputs.dispatch_source == 'external'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install Dependencies
+        run: python -m pip install -r requirements.txt
 
-      # 记录退出码供后续步骤判断。checkin.py 的约定：
-      #   0 = 签到成功（含“今天已签到”）
-      #   1 = 不可重试（token / cookie / 响应结构变更）
-      #   2 = 可重试（429 / 5xx / 连接异常）
-      - name: Run checkin script
-        id: first_checkin
-        continue-on-error: true
-        env:
-          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
-          # 新版签到校验会话绑定的浏览器；留空则用脚本内置 UA
-          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT }}
-        run: |
-          python checkin.py
-          code=$?
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit $code
+      - name: Run Tests
+        run: python -m unittest discover -s tests -v
 
-      # 只有可重试错误才值得等待重试：cookie/token 失效属于确定性失败，
-      # 等 5 分钟再跑一遍必然同样失败，白白消耗 Actions 配额。
-      # 注意这里用 outcome 而不是 conclusion —— continue-on-error 会把
-      # conclusion 改成 success，只有 outcome 保留真实结果。
-      - name: Wait 60s before retry
-        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
-        run: sleep 60
-
-      - name: Retry checkin script
-        id: retry_checkin
-        if: steps.first_checkin.outcome == 'failure' && steps.first_checkin.outputs.exit_code == '2'
-        continue-on-error: true
-        env:
-          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
-          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT }}
+      - name: Run Checkin
         run: python checkin.py
-
-      # 条件只看首次结果。不可重试错误（exit 1）时重试步骤是 skipped，
-      # 若把 retry_checkin 也写进条件，这里就不会执行，而 Run checkin script
-      # 带 continue-on-error，整个 job 会错误地显示成功。
-      - name: Report failure
-        if: steps.first_checkin.outcome == 'failure'
-        run: |
-          code="${{ steps.first_checkin.outputs.exit_code }}"
-          if [ "$code" = "1" ]; then
-            echo "::error::签到失败，且属于不可重试错误（token / cookie / 响应结构）。重试同一配置不会成功。"
-          elif [ "$code" = "2" ]; then
-            echo "::error::签到在 60 秒重试后仍然失败（网络或服务端临时故障）。"
-          else
-            echo "::error::签到失败，退出码 $code。"
-          fi
-          {
-            echo "### 签到失败"
-            echo ""
-            echo "本次退出码：**$code**"
-            echo ""
-            echo "| 退出码 | 含义 | 处理 |"
-            echo "| --- | --- | --- |"
-            echo "| \`1\` | 不可重试（token / cookie / 响应结构） | 展开 \`Run checkin script\`，按 ERROR 提示修复 |"
-            echo "| \`2\` | 可重试（网络 / 服务端故障） | 已自动等待 60 秒重试一次，可稍后手动重跑 |"
-            echo ""
-            echo "若提示 Cookie 已失效或没有权限，请重新登录 glados.cloud 并更新仓库 Secret \`GLADOS_COOKIE\`。"
-            echo "此任务以失败结束，供 GitHub Actions 原生通知报告。"
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 1
+        timeout-minutes: 8
+        env:
+          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+          # 必须与生成当前 gld:sess 的浏览器一致。
+          # 优先读仓库 Variable，兼容同名 Secret。
+          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
+          CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'fail_only' }}
+          EXCHANGE_PLAN: ${{ vars.EXCHANGE_PLAN || 'plan500' }}
+          CHECKIN_MAX_ATTEMPTS: '3'
+          CHECKIN_RETRY_DELAY_SECONDS: '60'
