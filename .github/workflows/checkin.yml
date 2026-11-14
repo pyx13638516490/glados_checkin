@@ -1,12 +1,12 @@
 name: GLaDOS 2026 Checkin
 
 on:
-  schedule:
-    # 北京时间 09:17 与 15:47。两次是有意为之：实测这个仓库的 schedule
-    # 经常延迟（约 6 小时）甚至被丢弃，两次能显著提高当天成功率。
-    # 签到幂等，重复运行无害。
-    - cron: '17 1 * * *'
-    - cron: '47 7 * * *'
+  # 2026-11-14 起 GLaDOS 要求 Cloudflare Turnstile，纯 HTTP 脚本无法通过，
+  # 自动签到已停用，改由本机 Windows 计划任务打开浏览器 + 脚本猫完成。
+  # 需要临时跑一次时用 workflow_dispatch 手动触发。
+  # schedule:
+  #   - cron: '17 1 * * *'
+  #   - cron: '47 7 * * *'
   workflow_dispatch:
     inputs:
       dispatch_source:
