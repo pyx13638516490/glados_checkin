@@ -7,6 +7,43 @@
 > [lankerr/2026-glados-checkin](https://github.com/lankerr/2026-glados-checkin)（MIT）。
 > 本项目保留其挑战式签到、设备校验、自动兑换与推送能力，并补充了本仓库的排障经验。
 
+## 当前方案：本机 Windows 计划任务（2026-11-14 起）
+
+GitHub Actions 的定时已停用（`schedule` 已注释），改成：
+
+```text
+18:10  Windows 计划任务「GLaDOS自动签到」
+       → 打开 Chrome 到 https://glados.rocks/console/checkin
+       → 浏览器里 ScriptCat 的既有脚本自动点 Checkin（Turnstile 由浏览器完成）
+       → 等 120 秒
+       → 运行 tools/notify_checkin.py，查积分并推 Server酱
+```
+
+凭证都放在 `%USERPROFILE%\.glados\`，**不进仓库**：
+
+| 文件 | 内容 | 什么时候要改 |
+|---|---|---|
+| `cookie.txt` | 整行 Cookie（rocks 域） | 每 30 天，或推送提示失效时 |
+| `sendkey.txt` | Server酱 SendKey | 换推送渠道时 |
+| `checkin.bat` | 计划任务执行的批处理 | 改浏览器或路径时 |
+
+更新 cookie：
+
+> 浏览器登录 glados.rocks → `F12` → **Application** → **Cookies** → `https://glados.rocks`
+> → 复制 `gld:accts`、`gld:accts.sig`、`gld:sess`、`gld:sess.sig` 四个值
+> → 拼成 `gld:accts=…; gld:accts.sig=…; gld:sess=…; gld:sess.sig=…` 覆盖 `cookie.txt`
+
+手动跑一次通知检查：
+
+```bash
+python tools/notify_checkin.py
+```
+
+退出码：`0` 今天已签到 / `1` 今天还没签到 / `2` cookie 失效或查询失败。
+
+> GitHub 那边的代码、测试和诊断能力全部保留。如果官方以后放松 Turnstile，
+> 把 `checkin.yml` 里注释掉的 `schedule` 恢复即可。
+
 ## 2026-11-14 起：Cloudflare Turnstile 拦截（自动签到失效）
 
 2026-11-14 起，GLaDOS 在挑战流程之外又加了 **Cloudflare Turnstile 人机验证**。
