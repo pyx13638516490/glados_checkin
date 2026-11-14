@@ -38,11 +38,6 @@ DOMAINS = [
     "https://glados.network",
 ]
 
-# 新版签到会校验会话绑定的浏览器，UA 不一致会返回 device-mismatch 或
-# "Automated check-in detected"。下面这个默认值取自 2026-11-11 生成当前
-# 会话的 Edge profile（chrome://version 的「用户代理」）。
-# 换浏览器或大版本升级后，应改用仓库 Variable GLADOS_USER_AGENT 覆盖，
-# 而不是改这里。
 DEFAULT_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
     'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -85,8 +80,57 @@ LEGACY_SESSION_COOKIES = ('koa:sess', 'koa:sess.sig')
 
 # ================= 工具函数 =================
 
+def beijing_now():
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
 def beijing_time():
-    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    return beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_finite_number(raw):
+    """Parse finite int/float or numeric string; reject booleans and non-finite values."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) if math.isfinite(raw) else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            num = float(text)
+        except ValueError:
+            return None
+        return num if math.isfinite(num) else None
+    return None
+
+
+def format_points_number(raw, signed=False):
+    """Format point amounts without truncating non-zero decimals (e.g. 14.0 -> 14, 1.5 -> 1.5)."""
+    num = parse_finite_number(raw)
+    if num is None:
+        return None
+    if abs(num - round(num)) < 1e-9:
+        integer = int(round(num))
+        if signed:
+            return f"+{integer}" if integer >= 0 else str(integer)
+        return str(integer)
+    formatted = f"{num:.4f}".rstrip('0').rstrip('.')
+    if signed and num >= 0 and not formatted.startswith('+'):
+        return '+' + formatted
+    return formatted
+
+
+def format_beijing_timestamp_ms(timestamp):
+    """Return (formatted_datetime, YYYY-MM-DD) in Beijing time for a ms epoch timestamp."""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+        return None, None
+    try:
+        dt = datetime.fromtimestamp(timestamp / 1000, timezone(timedelta(hours=8)))
+    except (ValueError, OverflowError, OSError):
+        return None, None
+    return dt.strftime('%Y-%m-%d %H:%M:%S 北京时间'), dt.strftime('%Y-%m-%d')
 
 
 def log(msg):
@@ -250,6 +294,15 @@ def get_browser_headers():
     return headers
 
 
+def is_turnstile_checkin_result(result):
+    """Return True when the server blocks automated check-in with Cloudflare Turnstile."""
+    if not isinstance(result, dict):
+        return False
+    reason = str(result.get('reason', '')).strip().lower()
+    message = str(result.get('message', '')).strip().lower()
+    return reason == 'turnstile' or 'cloudflare verification failed' in message
+
+
 def is_non_retryable_checkin_result(result):
     """Return True for authentication/device failures that waiting cannot fix."""
     if not isinstance(result, dict):
@@ -291,6 +344,8 @@ def summarize_checkin_failure(result):
         else:
             label = '网络或服务暂时异常，未收到有效 API 响应'
         label += '；本次请求失败，今日签到状态未知'
+    elif is_turnstile_checkin_result(result):
+        label = '服务端要求 Cloudflare Turnstile 人机验证，本次未入账；请通过官网浏览器手动签到'
     elif reason == 'device-mismatch':
         label = '服务端拒绝设备校验；请核对会话和 User-Agent 配置'
     elif 'automated check-in detected' in message:
@@ -309,7 +364,7 @@ def summarize_checkin_failure(result):
         details.append(f'http_status={status}')
     if result.get('request_failed') is True and result.get('timed_out') is True:
         details.append('timeout=true')
-    if reason in ('device-mismatch', 'http-auth-rejected'):
+    if reason in ('device-mismatch', 'http-auth-rejected', 'turnstile'):
         details.append(f'reason={reason}')
     return label + (f" [{', '.join(details)}]" if details else '')
 
@@ -331,7 +386,7 @@ def is_normal_checkin_result(result):
     """Return True for a new check-in or a harmless already-checked-in response."""
     if is_missing_api_response(result):
         return False
-    if is_non_retryable_checkin_result(result):
+    if is_non_retryable_checkin_result(result) or is_turnstile_checkin_result(result):
         return False
 
     message = str(result.get('message', '')).strip().lower()
@@ -341,6 +396,71 @@ def is_normal_checkin_result(result):
     # GLaDOS has historically used code=0 for successful check-ins. Newer
     # duplicate/observation responses can use code=1 and are handled above.
     return result.get('code') == 0
+
+
+REPEAT_CHECKIN_MESSAGES = (
+    "checkin repeats! please try tomorrow",
+    "today's observation logged",
+)
+
+BREAKDOWN_KEYS = ('base', 'level', 'streak', 'cable', 'lucky', 'site', 'exitIp')
+
+
+def is_repeat_checkin_result(result):
+    if not isinstance(result, dict):
+        return False
+    message = str(result.get('message', '')).strip().lower()
+    return result.get('code') == 1 or any(marker in message for marker in REPEAT_CHECKIN_MESSAGES)
+
+
+def extract_declared_checkin_points(result):
+    """Extract server-declared gained points and optional raw breakdown sum from /api/user/checkin."""
+    if not isinstance(result, dict):
+        return None, None
+    declared = parse_finite_number(result.get('points')) if 'points' in result else None
+    if declared is None:
+        message = str(result.get('message', ''))
+        match = re.search(r'checkin!\s*got\s*([+-]?\d+(?:\.\d+)?)\s*point', message, flags=re.IGNORECASE)
+        if match:
+            declared = parse_finite_number(match.group(1))
+
+    breakdown = result.get('breakdown') or result.get('settlement')
+    breakdown_sum = None
+    if isinstance(breakdown, dict):
+        values = [parse_finite_number(breakdown.get(key)) for key in BREAKDOWN_KEYS]
+        present = [v for v in values if v is not None]
+        if present:
+            breakdown_sum = sum(present)
+    return declared, breakdown_sum
+
+
+def summarize_current_run_gain(result, is_success, client):
+    """Keep API claims and ledger observations separate: no transaction linkage exists.
+
+    A same-day credit, even for the same amount, can be an earlier/manual or
+    unrelated credit. A final refusal/repeat response cannot exclude a credit
+    from an earlier request whose response was lost during this run.
+    """
+    if not is_success:
+        return '未确认（最终请求未成功；本轮是否入账未知，请核对完整流水）'
+
+    if is_repeat_checkin_result(result):
+        claim = '接口返回今日已签到（不能据此确定本轮新增积分）'
+    else:
+        declared_num, breakdown_sum = extract_declared_checkin_points(result)
+        if declared_num is None:
+            claim = '接口返回成功（本次入账归属未确认）'
+        else:
+            amount = format_points_number(declared_num, signed=True)
+            claim = f'接口声称 {amount} 分（本次入账归属未确认）'
+        if breakdown_sum is not None:
+            parts = format_points_number(breakdown_sum, signed=True)
+            claim += f'；接口分项合计 {parts} 分（不据此推断封顶规则）'
+
+    today_gain = getattr(client, 'today_positive_change', None)
+    if isinstance(today_gain, str):
+        return claim + f'；今日已读取流水中一笔正变动 {today_gain} 分（未关联本次请求，非今日合计）'
+    return claim + '；已读取流水中未识别到今日正变动（不等于没有入账，记录可能缺失或延迟）'
 
 
 def checkin_with_retry(client, attempts=3, delay_seconds=60):
@@ -355,6 +475,10 @@ def checkin_with_retry(client, attempts=3, delay_seconds=60):
 
         if is_non_retryable_checkin_result(last_result):
             log(f"❌ 签到认证失败，不再重试: {summarize_checkin_failure(last_result)}")
+            return last_result, False
+
+        if is_turnstile_checkin_result(last_result):
+            log(f"❌ 签到需要人机验证，停止自动重试: {summarize_checkin_failure(last_result)}")
             return last_result, False
 
         if attempt < attempts:
@@ -373,6 +497,9 @@ class GLaDOS:
         self.left_days = "?"
         self.points = "?"
         self.points_change = "?"
+        self.points_change_time = "未知"
+        self.today_positive_change = None
+        self.has_dated_history = False
         self.exchange_info = ""
         self.exchange_result = ""
         self.plan = "?"
@@ -451,29 +578,65 @@ class GLaDOS:
         """获取积分、变化历史、兑换计划"""
         res = self.req('GET', '/api/user/points')
         if res and 'points' in res:
-            # 当前积分
-            self.points = str(res.get('points', '0')).split('.')[0]
-            
-            # 最近一次积分变化
-            history = res.get('history', [])
+            # 当前积分（保留非零小数，不因 split('.') 截断小数奖励）
+            formatted_pts = format_points_number(res.get('points', '0'), signed=False)
+            self.points = formatted_pts if formatted_pts is not None else '0'
+
+            # This is the latest ledger entry, not a change caused by this run.
+            self.points_change = '?'
+            self.points_change_time = '未知'
+            self.today_positive_change = None
+            self.has_dated_history = False
+            today_bj = beijing_now().strftime('%Y-%m-%d')
+
+            history = res.get('history')
+            if not isinstance(history, list):
+                history = res.get('list') if isinstance(res.get('list'), list) else []
+
             if history:
-                last = history[0]
-                change = str(last.get('change', '0')).split('.')[0]
-                if not change.startswith('-'):
-                    change = '+' + change
-                self.points_change = change
-            
+                last = history[0] if isinstance(history[0], dict) else {}
+                formatted_change = format_points_number(last.get('change', '0'), signed=True)
+                self.points_change = formatted_change if formatted_change is not None else '+0'
+                formatted_dt, _ = format_beijing_timestamp_ms(last.get('time'))
+                if formatted_dt:
+                    self.points_change_time = formatted_dt
+
+                # Observation only: date/amount/business do not link a credit to this run.
+                for item in history[:10]:
+                    if not isinstance(item, dict):
+                        continue
+                    _, entry_date = format_beijing_timestamp_ms(item.get('time'))
+                    if entry_date:
+                        self.has_dated_history = True
+                    entry_num = parse_finite_number(item.get('change'))
+                    business = str(item.get('business', '')).strip().lower()
+                    if (
+                        self.today_positive_change is None
+                        and entry_date == today_bj
+                        and entry_num is not None
+                        and entry_num > 0
+                        and 'exchange' not in business
+                        and 'refund' not in business
+                    ):
+                        self.today_positive_change = format_points_number(entry_num, signed=True)
+
             # 兑换计划
             plans = res.get('plans', {})
-            pts = int(float(self.points))
+            pts = parse_finite_number(self.points)
+            if pts is None:
+                pts = 0.0
             exchange_lines = []
-            for plan_data in plans.values():
-                need = int(plan_data.get('points', 0))
-                days = plan_data.get('days', '?')
-                if pts >= need:
-                    exchange_lines.append(f"✅ {need}分→{days}天 (可兑换)")
-                else:
-                    exchange_lines.append(f"❌ {need}分→{days}天 (差{need-pts}分)")
+            if isinstance(plans, dict):
+                for plan_data in plans.values():
+                    if not isinstance(plan_data, dict):
+                        continue
+                    need = int(plan_data.get('points', 0))
+                    days = plan_data.get('days', '?')
+                    if pts >= need:
+                        exchange_lines.append(f"✅ {need}分→{days}天 (可兑换)")
+                    else:
+                        diff_label = format_points_number(need - pts, signed=False) or str(need)
+                        exchange_lines.append(f"❌ {need}分→{days}天 (差{diff_label}分)")
             self.exchange_info = "<br>".join(exchange_lines)
             return True
         return False
@@ -530,14 +693,14 @@ def auto_exchange(g, plan_id):
     info = EXCHANGE_PLANS[plan_id]
     need, days = info["points"], info["days"]
 
-    try:
-        pts = int(float(g.points))
-    except (TypeError, ValueError):
+    pts = parse_finite_number(getattr(g, 'points', None))
+    if pts is None:
         log("⚠️ 积分查询失败，跳过兑换")
         return "⚠️ 兑换跳过(积分查询失败)"
 
+    pts_label = format_points_number(pts, signed=False)
     if pts < need:
-        return f"⏭️ 积分不足({pts}/{need})，攒够自动兑换{days}天"
+        return f"⏭️ 积分不足({pts_label}/{need})，攒够自动兑换{days}天"
 
     res = g.exchange(plan_id)
     if res and res.get('code') == 0:
@@ -721,29 +884,38 @@ def main():
         res, is_success = checkin_with_retry(g, attempts, delay_seconds)
         msg = res.get('message', 'Success') if is_success else summarize_checkin_failure(res)
 
+        gain_summary = '未确认（最终请求未成功；本轮是否入账未知，请核对完整流水）'
         if is_non_retryable_checkin_result(res):
             # Stop all follow-up requests for this account after an explicit denial.
             g.exchange_result = '⏭️ 认证被拒绝，跳过兑换'
         elif is_missing_api_response(res):
             # Do not add more reads or attempt redemption during a transport outage.
             g.exchange_result = '⏭️ 本次请求失败，跳过积分查询和兑换'
+            gain_summary = '未获取（本次请求失败，今日签到状态未知）'
         else:
             # 2. Get Info (Refresh data)
             g.get_status()
             g.get_points()
+            gain_summary = summarize_current_run_gain(res, is_success, g)
 
-            # 2.5 Auto exchange (issue #11): runs after check-in so the
-            # just-earned points count toward the threshold.
+            # 2.5 Auto exchange (issue #11): runs only after a normal check-in
+            # so failed check-ins do not trigger unexpected redemptions.
             if exchange_plan:
-                g.exchange_result = auto_exchange(g, exchange_plan)
-                if not g.exchange_result.startswith("⏭️"):
-                    exchange_events += 1
+                if is_success:
+                    g.exchange_result = auto_exchange(g, exchange_plan)
+                    if not g.exchange_result.startswith("⏭️"):
+                        exchange_events += 1
+                else:
+                    g.exchange_result = '⏭️ 本次签到未成功，跳过兑换'
 
         # 3. Log
         status_icon = "✅" if is_success else "❌"
         # Actions logs are public in a public repository. Keep account details
         # inside the private notification instead of exposing the email here.
-        log(f"{status_icon} 账号 {i} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
+        log(
+            f"{status_icon} 账号 {i} | 积分: {g.points} | 入账核验: {gain_summary} | "
+            f"天数: {g.left_days} | 结果: {msg}"
+        )
 
         if is_success:
             success_cnt += 1
@@ -751,7 +923,14 @@ def main():
         # 4. Result Formatting
         account_label = str(g.email) if g.email != '?' else f'账号 {i}'
         points_label = str(g.points) if g.points != '?' else '未获取'
-        change_label = f'({g.points_change})' if g.points_change != '?' else ''
+        change_time = (
+            g.points_change_time
+            if isinstance(getattr(g, 'points_change_time', None), str) else '未知'
+        )
+        history_label = (
+            f'{g.points_change}（{change_time}；历史记录，不代表本次新增）'
+            if g.points_change != '?' else '未获取'
+        )
         days_label = f'{g.left_days} 天' if g.left_days != '?' else '未获取'
         exchange_line = ""
         if exchange_plan:
@@ -760,7 +939,9 @@ def main():
         results.append(f"""
 <div style="border:2px solid #333; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
     <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">👤 {html.escape(account_label)}</h3>
-    <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{html.escape(points_label)}</span> <span style="color:#27ae60; font-weight:bold;">{html.escape(change_label)}</span></p>
+    <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{html.escape(points_label)}</span></p>
+    <p style="margin:8px 0; color:#000; font-size:15px;"><b>签到响应与流水观察:</b> {html.escape(gain_summary)}</p>
+    <p style="margin:8px 0; color:#666; font-size:14px;"><b>最近一笔积分变动:</b> {html.escape(history_label)}</p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>剩余天数:</b> <span style="font-weight:bold;">{html.escape(days_label)}</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>签到结果:</b> {html.escape(str(msg))}</p>{exchange_line}
     <div style="margin-top:15px; padding:12px; background:#f0f0f0; border-radius:8px; border:1px solid #ccc;">

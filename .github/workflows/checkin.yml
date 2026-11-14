@@ -2,9 +2,9 @@ name: GLaDOS 2026 Checkin
 
 on:
   schedule:
-    # 北京时间 09:17 与 15:47。一天两次是有意为之：
-    # GitHub 的 schedule 经常延迟（实测约 6 小时），偶尔直接丢弃，
-    # 两次能显著降低"当天没签到"的概率。签到是幂等的，重复运行无害。
+    # 北京时间 09:17 与 15:47。两次是有意为之：实测这个仓库的 schedule
+    # 经常延迟（约 6 小时）甚至被丢弃，两次能显著提高当天成功率。
+    # 签到幂等，重复运行无害。
     - cron: '17 1 * * *'
     - cron: '47 7 * * *'
   workflow_dispatch:
@@ -57,19 +57,18 @@ jobs:
         timeout-minutes: 8
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          # 必须与生成当前会话的浏览器一致，否则签到会被 device-mismatch 拒绝。
-          # 优先读仓库 Variable，兼容同名 Secret；两者都为空时用 checkin.py
-          # 内置的默认 UA（已按当前登录的 Edge 生成）。
+          # Must match the browser that created the current gld:sess.
+          # Prefer the repository Variable; accept a same-named Secret for compatibility.
           GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
           CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 默认改成 all：每天都推一条，里面带当前积分和最近一次变化量。
-          # 这样"签到成功了但没给分"这种静默失败也能看出来——那正是
-          # 2026-11-03~11-10 连续 8 天的情况，CI 全绿却一分没进。
-          # 只想在失败时收消息的话，配仓库 Variable PUSH_LEVEL=fail_only。
+          # 每天推一条：正文带「本次签到入账」和「最近一笔历史流水」，
+          # 两者分开。Turnstile 拦截时能立刻看到"本次未签到成功 0 分"，
+          # 不会把昨天的加分误读成今天的。
+          # 只想收失败消息的话，配仓库 Variable PUSH_LEVEL=fail_only。
           PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'all' }}
           EXCHANGE_PLAN: ${{ vars.EXCHANGE_PLAN || 'plan500' }}
           CHECKIN_MAX_ATTEMPTS: '3'

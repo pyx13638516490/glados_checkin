@@ -7,6 +7,33 @@
 > [lankerr/2026-glados-checkin](https://github.com/lankerr/2026-glados-checkin)（MIT）。
 > 本项目保留其挑战式签到、设备校验、自动兑换与推送能力，并补充了本仓库的排障经验。
 
+## 2026-11-14 起：Cloudflare Turnstile 拦截（自动签到失效）
+
+2026-11-14 起，GLaDOS 在挑战流程之外又加了 **Cloudflare Turnstile 人机验证**。
+纯 HTTP 脚本即使正确提交 `nonce/proof`，也会收到：
+
+```json
+{"code": 5, "reason": "turnstile", "points": 0,
+ "message": "Cloudflare verification failed. Nothing was recorded — please retry."}
+```
+
+挑战接口会多返回一个 `turnstile` sitekey，要求浏览器执行 JS 生成验证 token，
+这是专门用来挡自动化的。
+
+**上游立场明确**（[issue #37](https://github.com/lankerr/2026-glados-checkin/issues/37)）：
+
+> 本项目不提供绕过 Cloudflare Turnstile 人机验证的功能。自动签到若返回
+> `reason=turnstile`，请改用浏览器在官网手动完成验证签到。
+
+所以现在**自动签到走不通了**，脚本退化为：
+
+- 检测到 `reason=turnstile` 立即停止，不再重试三次
+- 推送里明确写「本次未签到成功，0 分」并标 `[code=5, reason=turnstile]`
+- 把「本次入账」和「最近一笔历史流水」分开，避免把昨天的加分误读成今天
+
+日常请手动签到：打开控制台 → 点 `Checkin`（浏览器会自动完成 Turnstile）。
+每天那条失败推送就当作「该手动签了」的提醒。
+
 ## 2026-11 签到只给 1 分：缺了挑战流程
 
 2026-11-05 起，只提交 `{"token": ...}` 的旧签到流程仍然返回成功，
