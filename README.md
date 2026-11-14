@@ -15,31 +15,33 @@ GitHub Actions 的定时已停用（`schedule` 已注释），改成：
 18:10  Windows 计划任务「GLaDOS自动签到」
        → 打开 Chrome 到 https://glados.rocks/console/checkin
        → 浏览器里 ScriptCat 的既有脚本自动点 Checkin（Turnstile 由浏览器完成）
-       → 等 120 秒
-       → 运行 tools/notify_checkin.py，查积分并推 Server酱
+       → 等 120 秒（ping 等待，timeout 在计划任务里会失效）
+       → 运行 tools/notify_browser.py，用 bsk 读页面并推 Server酱
 ```
 
 凭证都放在 `%USERPROFILE%\.glados\`，**不进仓库**：
 
 | 文件 | 内容 | 什么时候要改 |
 |---|---|---|
-| `cookie.txt` | 整行 Cookie（rocks 域） | 每 30 天，或推送提示失效时 |
 | `sendkey.txt` | Server酱 SendKey | 换推送渠道时 |
+| `state.json` | 上次读到的积分/连续天数（判断签到用） | 自动维护，不用管 |
 | `checkin.bat` | 计划任务执行的批处理 | 改浏览器或路径时 |
+| `cookie.txt` | 旧版 API 方案用，**现在不再需要** | — |
 
-更新 cookie：
+> 早期版本用 `tools/notify_checkin.py` + 静态 cookie 调 API，cookie 有 30 天硬限制。
+> 现在改用 `tools/notify_browser.py`：由 bsk 打开页面读 `POINTS` / `STREAK`，
+> cookie 由浏览器自己维护，不需要再手动更新。
 
-> 浏览器登录 glados.rocks → `F12` → **Application** → **Cookies** → `https://glados.rocks`
-> → 复制 `gld:accts`、`gld:accts.sig`、`gld:sess`、`gld:sess.sig` 四个值
-> → 拼成 `gld:accts=…; gld:accts.sig=…; gld:sess=…; gld:sess.sig=…` 覆盖 `cookie.txt`
+判断「今天签没签到」：页面只给 `POINTS` 和 `STREAK` 两个数字，没有“今日已签”的字样，
+所以拿 `STREAK` 与 `state.json` 里上次运行的值比较——变大就是签上了，没变就是没签。
 
-手动跑一次通知检查：
+手动跑一次：
 
 ```bash
-python tools/notify_checkin.py
+python tools/notify_browser.py
 ```
 
-退出码：`0` 今天已签到 / `1` 今天还没签到 / `2` cookie 失效或查询失败。
+退出码：`0` 已签到 / `1` 未签到 / `2` 读取失败。
 
 > GitHub 那边的代码、测试和诊断能力全部保留。如果官方以后放松 Turnstile，
 > 把 `checkin.yml` 里注释掉的 `schedule` 恢复即可。
