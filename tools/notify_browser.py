@@ -71,6 +71,34 @@ def run_bsk(args, timeout=90):
     return p.returncode, out
 
 
+def ensure_daemon():
+    """bsk daemon 不在就尝试拉起来（机器重启后它不会自启）。"""
+    code, out = run_bsk(["status"], timeout=15)
+    if code == 0 and "pid" in out:
+        return True
+    log("bsk daemon 未运行，尝试启动")
+    exe = bsk_path()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen(
+            [exe, "daemon", "start"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"启动 daemon 失败: {type(e).__name__}")
+        return False
+    import time
+    for _ in range(12):
+        time.sleep(1)
+        code, out = run_bsk(["status"], timeout=10)
+        if code == 0 and "pid" in out:
+            log("bsk daemon 已启动")
+            return True
+    return False
+
+
 def pick_browser():
     code, out = run_bsk(["browsers", "--json"])
     if code != 0:
@@ -168,6 +196,8 @@ def main():
     sendkey = load_sendkey()
     session = None
     try:
+        if not ensure_daemon():
+            raise RuntimeError("bsk daemon 无法启动")
         browser = pick_browser()
         code, out = run_bsk(["session", "start", "--browser", browser,
                              "--agent-name", "GLaDOS通知", "--json"])
