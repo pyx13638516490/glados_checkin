@@ -13,35 +13,39 @@ GitHub Actions 的定时已停用（`schedule` 已注释），改成：
 
 ```text
 18:10  Windows 计划任务「GLaDOS自动签到」
-       → 打开 Chrome 到 https://glados.rocks/console/checkin
-       → 浏览器里 ScriptCat 的既有脚本自动点 Checkin（Turnstile 由浏览器完成）
-       → 等 120 秒（ping 等待，timeout 在计划任务里会失效）
-       → 运行 tools/notify_browser.py，用 bsk 读页面并推 Server酱
+       → tools/auto_checkin.py
+          1. 确保 bsk daemon 在跑
+          2. 连 Chrome 打开 https://glados.rocks/console/checkin
+          3. 点掉 Turnstile 的 "Verify you are human" 复选框（等 Success!）
+          4. 点 Checkin 按钮
+          5. 读 "Checkin! Got N Points"、POINTS、STREAK
+          6. Server酱 推送结果
 ```
+
+**关键发现（2026-11-15）**：Turnstile 并非完全无法自动化。它是 managed 模式，
+bsk 能在 VOM 里看到 `checkbox "Verify you are human"`，点击后页面显示 `Success!`，
+随后点 Checkin 就能正常拿到积分（实测 329→334、STREAK 4→5）。纯 HTTP 脚本做不到，
+真浏览器可以。
 
 凭证都放在 `%USERPROFILE%\.glados\`，**不进仓库**：
 
 | 文件 | 内容 | 什么时候要改 |
 |---|---|---|
 | `sendkey.txt` | Server酱 SendKey | 换推送渠道时 |
-| `state.json` | 上次读到的积分/连续天数（判断签到用） | 自动维护，不用管 |
-| `checkin.bat` | 计划任务执行的批处理 | 改浏览器或路径时 |
-| `cookie.txt` | 旧版 API 方案用，**现在不再需要** | — |
-
-> 早期版本用 `tools/notify_checkin.py` + 静态 cookie 调 API，cookie 有 30 天硬限制。
-> 现在改用 `tools/notify_browser.py`：由 bsk 打开页面读 `POINTS` / `STREAK`，
-> cookie 由浏览器自己维护，不需要再手动更新。
-
-判断「今天签没签到」：页面只给 `POINTS` 和 `STREAK` 两个数字，没有“今日已签”的字样，
-所以拿 `STREAK` 与 `state.json` 里上次运行的值比较——变大就是签上了，没变就是没签。
+| `state.json` | 上次的积分/连续天数 | 自动维护 |
+| `checkin.bat` | 计划任务执行的批处理 | 改路径时 |
 
 手动跑一次：
 
 ```bash
-python tools/notify_browser.py
+python tools/auto_checkin.py        # 全自动签到 + 推送
+python tools/notify_browser.py      # 只读检查，不点击
 ```
 
-退出码：`0` 已签到 / `1` 未签到 / `2` 读取失败。
+退出码（auto_checkin）：`0` 签到成功 / `1` 今天已签到或未确认 / `2` 执行失败。
+
+> 注意：Turnstile 是 Cloudflare 的反自动化机制。用真实浏览器点击通过验证在功能上可行，
+> 但请自行判断是否符合服务方条款，风险自负。
 
 > GitHub 那边的代码、测试和诊断能力全部保留。如果官方以后放松 Turnstile，
 > 把 `checkin.yml` 里注释掉的 `schedule` 恢复即可。
