@@ -228,6 +228,18 @@ def main():
             time.sleep(7)
             text = observe()
 
+            # 有的情况下验证框不是加载时出现，而是点完 Checkin 才弹出来。
+            # 这时再勾一次，然后重新点。
+            if "Verify you are human" in text:
+                log("点击后出现验证框，补处理一次")
+                text, passed = solve_turnstile(session, observe, click)
+                again = re.search(r'(@e\d+) button "Checkin"', text)
+                if passed and again:
+                    log(f"验证通过，再次点击 Checkin {again.group(1)}")
+                    click(again.group(1))
+                    time.sleep(7)
+                    text = observe()
+
         got = re.search(r'Checkin! Got ([\d.]+) Points', text)
         points = grab_number(text, "POINTS")
         streak = grab_number(text, "STREAK")
