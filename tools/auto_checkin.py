@@ -33,7 +33,9 @@ STATE_FILE = CONF_DIR / "state.json"
 SENDKEY_FILE = CONF_DIR / "sendkey.txt"
 
 URL = "https://glados.rocks/console/checkin"
-BROWSER_NAME = "chrome"
+# 优先 Chrome（脚本猫所在），Chrome 没连上时退回 Edge——本脚本自己做点击，
+# 不依赖脚本猫，只要那个浏览器里登录着 glados.rocks 就行。
+BROWSER_CANDIDATES = ["chrome", "edge"]
 
 BSK_CANDIDATES = [
     os.path.expandvars(r"%USERPROFILE%\.local\bin\bsk.exe"),
@@ -103,10 +105,12 @@ def pick_browser():
     m = re.search(r"\[.*\]", out, re.S)
     if not m:
         raise RuntimeError("无法解析 bsk browsers")
-    for b in json.loads(m.group(0)):
-        if b.get("browser_name") == BROWSER_NAME and not b.get("unresponsive"):
-            return b["instance_id"]
-    raise RuntimeError(f"没有可用的 {BROWSER_NAME} 实例")
+    data = json.loads(m.group(0))
+    for name in BROWSER_CANDIDATES:
+        for b in data:
+            if b.get("browser_name") == name and not b.get("unresponsive"):
+                return b["instance_id"], name
+    raise RuntimeError("没有可用的 Chrome / Edge 实例")
 
 
 def grab_number(text, label):
@@ -162,9 +166,14 @@ def push(sendkey, title, body):
     return False
 
 
-def solve_turnstile(session, observe, click):
-    """如果页面出现 Turnstile 复选框就点掉，返回是否处理过。"""
-    text = observe()
+def solve_turnstile(session, coop, click):
+    """如果页面出现 Turnstile 复选框就点掉，返回 (文本, 是否处理过)。
+
+    注意：必须用 cooperate sync 返回的 context 和「同一次 sync 里的」ref，
+    旧的 observe ref 会失效（实测 ref 编号每次 sync 都会变，用旧 ref 会报
+    "shared page control or observation changed"）。
+    """
+    ctx, text = coop()
     if "Verify you are human" not in text:
         log("没有 Turnstile 复选框（可能已通过或未出现）")
         return text, False
@@ -175,10 +184,10 @@ def solve_turnstile(session, observe, click):
         return text, False
 
     log(f"发现 Turnstile 复选框 {m.group(1)}，点击")
-    click(m.group(1))
-    time.sleep(7)
+    click(m.group(1), ctx)
+    time.sleep(8)
 
-    text = observe()
+    ctx, text = coop()
     if "Success!" in text:
         log("Turnstile 验证通过（Success!）")
         return text, True
@@ -195,51 +204,80 @@ def main():
     try:
         if not ensure_daemon():
             raise RuntimeError("bsk daemon 无法启动")
-        browser = pick_browser()
+        browser, browser_name = pick_browser()
         code, out = run_bsk(["session", "start", "--browser", browser,
                              "--agent-name", "GLaDOS自动签到", "--json"])
         if code != 0:
             raise RuntimeError(f"启动会话失败: {out[:200]}")
         m = re.search(r"\{.*\}", out, re.S)
         session = json.loads(m.group(0))["session_id"]
-        log(f"会话 {session} 已启动（{browser}）")
+        log(f"会话 {session} 已启动（{browser_name} {browser}）")
+
+        def coop():
+            """return (context_id, observation_text) —— ref 必须来自同一次 sync。"""
+            code, out = run_bsk(["cooperate", "--session", session, "sync", "--json"])
+            m = re.search(r"\{.*\}", out, re.S)
+            if not m:
+                raise RuntimeError(f"cooperate sync 失败: {out[:200]}")
+            d = json.loads(m.group(0))
+            text = (d.get("observation") or {}).get("text") or ""
+            return d.get("context_id"), text
+
+        def click(ref, ctx):
+            code, out = run_bsk(
+                ["click", "--session", session, "--context", ctx, "--ref", ref], timeout=45
+            )
+            if code != 0:
+                log(f"点击 {ref} 失败: {out[:160]}")
+            return code == 0
 
         def observe():
-            _, t = run_bsk(["observe", "--session", session, "--max-tokens", "4000"])
-            return t
-
-        def click(ref):
-            run_bsk(["click", "--session", session, "--ref", ref], timeout=45)
+            """只读全量观察（cooperate 返回的 text 会被截断，读数据不够用）。"""
+            code, out = run_bsk(["observe", "--session", session, "--max-tokens", "4000"])
+            return out
 
         run_bsk(["navigate", "--session", session, URL])
-        time.sleep(4)
+        time.sleep(5)
 
-        text, ok = solve_turnstile(session, observe, click)
+        text, ok = solve_turnstile(session, coop, click)
         if not ok and "Verify you are human" in text:
             raise RuntimeError("Turnstile 未能通过")
 
         # 点 Checkin：只匹配纯 "Checkin"，不碰 "Checkin! Got N Points"
+        ctx, text = coop()
         btn = re.search(r'(@e\d+) button "Checkin"', text)
         if not btn:
             log("没有可点的 Checkin 按钮（今天可能已签到）")
         else:
             log(f"点击 Checkin 按钮 {btn.group(1)}")
-            click(btn.group(1))
-            time.sleep(7)
-            text = observe()
+            click(btn.group(1), ctx)
 
-            # 有的情况下验证框不是加载时出现，而是点完 Checkin 才弹出来。
-            # 这时再勾一次，然后重新点。
-            if "Verify you are human" in text:
-                log("点击后出现验证框，补处理一次")
-                text, passed = solve_turnstile(session, observe, click)
-                again = re.search(r'(@e\d+) button "Checkin"', text)
-                if passed and again:
-                    log(f"验证通过，再次点击 Checkin {again.group(1)}")
-                    click(again.group(1))
-                    time.sleep(7)
-                    text = observe()
+            # 点完之后 Turnstile 可能是异步加载的（实测 2026-11-16：
+            # 页面加载 15 秒都没有验证框，点 Checkin 后才出现）。
+            # 轮询观察，最多 30 秒，边等边处理。
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                time.sleep(3)
+                text = observe()
+                if "Checkin! Got" in text:
+                    log("已拿到签到结果")
+                    break
+                ctx2, ctext = coop()
+                box = re.search(r'(@e\d+) checkbox "Verify you are human"', ctext)
+                if box:
+                    log(f"检测到验证框 {box.group(1)}，点击")
+                    click(box.group(1), ctx2)
+                    time.sleep(8)
+                    ctx2, ctext = coop()
+                    if "Success!" in ctext or "Verify you are human" not in ctext:
+                        log("验证通过，重新点 Checkin")
+                        again = re.search(r'(@e\d+) button "Checkin"', ctext)
+                        if again:
+                            click(again.group(1), ctx2)
+                    continue
 
+        # 统一用全量 observe 读结果（cooperate 的 text 会被截断）
+        text = observe()
         got = re.search(r'Checkin! Got ([\d.]+) Points', text)
         points = grab_number(text, "POINTS")
         streak = grab_number(text, "STREAK")
