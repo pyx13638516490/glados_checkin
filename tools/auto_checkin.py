@@ -244,8 +244,16 @@ def main():
             raise RuntimeError("Turnstile 未能通过")
 
         # 点 Checkin：只匹配纯 "Checkin"，不碰 "Checkin! Got N Points"
-        ctx, text = coop()
-        btn = re.search(r'(@e\d+) button "Checkin"', text)
+        # cooperate 返回的文本是截断的，按钮不一定第一次就在里面，
+        # 所以多 sync 几次（每次都会重新编号 ref，必须用当次的结果）。
+        btn = None
+        for _ in range(5):
+            ctx, text = coop()
+            btn = re.search(r'(@e\d+) button "Checkin"', text)
+            if btn or "Checkin! Got" in text:
+                break
+            time.sleep(1.5)
+
         if not btn:
             log("没有可点的 Checkin 按钮（今天可能已签到）")
         else:
