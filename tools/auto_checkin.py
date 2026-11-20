@@ -237,7 +237,19 @@ def main():
             return out
 
         run_bsk(["navigate", "--session", session, URL])
-        time.sleep(5)
+        # 等页面真正渲染出来（Chrome 刚被拉起时，navigate 返回 load 不代表
+        # Vue 已经渲染完，过早 observe 会拿到空页面，POINTS 解析成 None）
+        loaded = False
+        for _ in range(12):
+            time.sleep(2)
+            t = observe()
+            if "POINTS" in t and "Checkin" in t:
+                loaded = True
+                break
+        if not loaded:
+            log("页面 24 秒内仍未渲染出 POINTS，继续尝试")
+        else:
+            log("页面已渲染")
 
         text, ok = solve_turnstile(session, coop, click)
         if not ok and "Verify you are human" in text:
