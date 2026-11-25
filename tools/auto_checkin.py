@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""GLaDOS 全自动签到（浏览器版）：勾 Turnstile → 点 Checkin → 推送结果。
+"""GLaDOS 全自动签到：默认走纯 HTTP API，只有真正需要时才动用浏览器。
 
-2026-11-14 起签到要求 Cloudflare Turnstile。实测（2026-11-15）：bsk 能看到
-页面上的复选框 `checkbox "Verify you are human"`，点一下就变成 `Success!`，
-之后再点 Checkin 就能正常拿到积分。所以纯 HTTP 做不到的事，用真浏览器反而能做。
+2026-11-25 实测：服务端已不再对签到强制 Cloudflare Turnstile ——
+`GET /api/user/checkin/challenge` 拿 nonce → `sha256(nonce + ".glados-observe-v1")`
+→ `POST /api/user/checkin`，直接返回 code=0（已签到时 code=1 / repeated:true），
+不会报 `code=5 / reason=turnstile`。
 
-流程：
+所以主路径回到纯 HTTP：不依赖 bsk daemon、不依赖 Chrome 在前台、
+不会有 cooperate context 过期和 observation 文本截断 —— 这些正是 2026-11-24/25
+在无人值守环境下连续失败两个晚上的原因。
+
+降级到浏览器兜底的两种情况：
+  1. API 返回 code=5 / reason=turnstile（Turnstile 又收紧了）
+  2. API 返回 401/403（cookie.txt 过期，浏览器里通常还登录着）
+
+浏览器兜底流程（2026-11 之前的主路径）：
   1. 确保 bsk daemon 在跑（机器重启后它不自启）
   2. 连 Chrome 开会话，打开 glados.rocks/console/checkin
   3. 等页面渲染，observe 找 Turnstile 复选框；有就点，等它变成 Success!
   4. observe 找纯 "Checkin" 按钮（不带 Got 字样）；有就点
   5. 再 observe 读结果：`Checkin! Got N Points` 表示签到成功
-  6. Server酱 推送
 
 退出码：0 签到成功 / 1 今天已签到或未能确认 / 2 执行失败
 """
@@ -31,6 +39,13 @@ from pathlib import Path
 CONF_DIR = Path(os.path.expanduser("~")) / ".glados"
 STATE_FILE = CONF_DIR / "state.json"
 SENDKEY_FILE = CONF_DIR / "sendkey.txt"
+COOKIE_FILE = CONF_DIR / "cookie.txt"
+
+API_BASES = ["https://glados.rocks", "https://glados.cloud"]
+API_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0"
+)
 
 URL = "https://glados.rocks/console/checkin"
 # 优先 Chrome（脚本猫所在），Chrome 没连上时退回 Edge——本脚本自己做点击，
@@ -166,6 +181,142 @@ def push(sendkey, title, body):
     return False
 
 
+def api_checkin(cookie):
+    """纯 HTTP 签到。返回 dict，status 取值：
+
+    ok        签到成功（本次入账 points 分）
+    repeated  今天已经签过，服务器拒绝重复
+    turnstile 被 Turnstile 拦住，需要浏览器兜底
+    auth      cookie 失效（401/403），需要浏览器兜底
+    error     网络/解析失败，可以再试浏览器
+    """
+    import hashlib
+
+    import requests
+
+    headers = {
+        "User-Agent": API_USER_AGENT,
+        "Cookie": cookie,
+        "Content-Type": "application/json",
+    }
+    for base in API_BASES:
+        h = dict(headers, Origin=base, Referer=f"{base}/console/checkin")
+        payload = None
+        for attempt in range(2):
+            try:
+                ch = requests.get(
+                    f"{base}/api/user/checkin/challenge", headers=h, timeout=20
+                )
+                if ch.status_code in (401, 403):
+                    log(f"{base} challenge 返回 HTTP {ch.status_code}（cookie 失效）")
+                    return {"status": "auth"}
+                payload = ch.json()
+                break
+            except Exception as e:  # noqa: BLE001
+                log(f"{base} challenge 异常({attempt + 1}/2): {type(e).__name__}")
+                time.sleep(3)
+        if payload is None:
+            continue
+        if payload.get("code") != 0 or not payload.get("nonce"):
+            log(f"{base} challenge 内容异常: {str(payload)[:120]}")
+            continue
+
+        nonce = payload["nonce"]
+        proof = hashlib.sha256((nonce + ".glados-observe-v1").encode()).hexdigest()
+        try:
+            r = requests.post(
+                f"{base}/api/user/checkin",
+                headers=h,
+                json={"token": cookie, "nonce": nonce, "proof": proof},
+                timeout=25,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"{base} 签到请求异常: {type(e).__name__}")
+            continue
+        if r.status_code in (401, 403):
+            log(f"{base} 签到返回 HTTP {r.status_code}（cookie 失效）")
+            return {"status": "auth"}
+        try:
+            data = r.json()
+        except ValueError:
+            log(f"{base} 签到响应不是 JSON: {r.text[:120]}")
+            continue
+
+        log(f"{base} 签到响应: {json.dumps(data, ensure_ascii=False)[:220]}")
+        if data.get("code") == 5 or data.get("reason") == "turnstile":
+            return {"status": "turnstile"}
+
+        balance = None
+        for row in data.get("list") or []:
+            if row.get("business") == "system:checkin" and row.get("balance"):
+                balance = row["balance"]
+                break
+        result = {
+            "status": "repeated" if data.get("repeated") else "ok",
+            "points": data.get("points"),
+            "streak": data.get("streak"),
+            "balance": balance,
+            "message": data.get("message"),
+        }
+        # 剩余天数只在 status 接口里有；失败不影响主流程
+        try:
+            st = requests.get(f"{base}/api/user/status", headers=h, timeout=15).json()
+            left = (st.get("data") or {}).get("leftDays")
+            if left is not None:
+                result["days"] = int(float(left))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    return {"status": "error"}
+
+
+def report_api(sendkey, state, res):
+    """把 API 结果整理成推送并发出去，返回退出码。"""
+    balance = res.get("balance")
+    points = "-"
+    try:
+        if balance is not None:
+            points = int(float(balance))
+    except (TypeError, ValueError):
+        pass
+    streak = res.get("streak")
+    if streak is None:
+        streak = state.get("streak", "-")
+    days = res.get("days")
+    days_line = f"剩余天数：{days} 天\n" if days is not None else ""
+
+    prev_points = state.get("points")
+    delta = ""
+    try:
+        if prev_points is not None and isinstance(points, int):
+            delta = f"（较上次 {points - int(prev_points):+d} 分）"
+    except (TypeError, ValueError):
+        pass
+
+    if res.get("status") == "ok":
+        got = res.get("points")
+        title = f"GLaDOS 签到成功 ✅ +{got} 分（共 {points}）"
+        body = (f"本次入账：+{got} 分\n"
+                f"当前积分：{points}{delta}\n"
+                f"连续签到：{streak} 天\n{days_line}"
+                f"方式：API")
+        rc = 0
+    else:
+        title = f"GLaDOS 今天已签到（{points} 分）"
+        body = (f"当前积分：{points}{delta}\n"
+                f"连续签到：{streak} 天\n{days_line}"
+                f"今天之前已经签过，未重复提交。\n方式：API")
+        rc = 1
+
+    push(sendkey, title, body)
+    save_state({
+        "date": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+        "points": points if isinstance(points, int) else prev_points,
+        "streak": streak,
+    })
+    return rc
+
+
 def solve_turnstile(session, coop, click):
     """如果页面出现 Turnstile 复选框就点掉，返回 (文本, 是否处理过)。
 
@@ -200,6 +351,28 @@ def solve_turnstile(session, coop, click):
 
 def main():
     sendkey = load_sendkey()
+    state = load_state()
+
+    # ---------- 第一阶段：纯 HTTP API（默认路径） ----------
+    # 不碰浏览器：没有 daemon、没有 Chrome 前台、没有 cooperate context。
+    cookie = ""
+    if COOKIE_FILE.exists():
+        cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
+    if not cookie:
+        log("没有 cookie.txt，跳过 API，直接用浏览器")
+    else:
+        res = api_checkin(cookie)
+        status = res.get("status")
+        if status in ("ok", "repeated"):
+            return report_api(sendkey, state, res)
+        if status == "turnstile":
+            log("API 被 Turnstile 拦住 → 降级到浏览器")
+        elif status == "auth":
+            log("Cookie 已失效 → 降级到浏览器")
+        else:
+            log("API 请求失败 → 降级到浏览器")
+
+    # ---------- 第二阶段：浏览器兜底 ----------
     session = None
     try:
         if not ensure_daemon():
@@ -256,21 +429,24 @@ def main():
             raise RuntimeError("Turnstile 未能通过")
 
         # 点 Checkin：只匹配纯 "Checkin"，不碰 "Checkin! Got N Points"
-        # cooperate 返回的文本是截断的，按钮不一定第一次就在里面，
-        # 所以多 sync 几次（每次都会重新编号 ref，必须用当次的结果）。
-        btn = None
-        for _ in range(5):
+        # cooperate 的 context 会过期（报 control context no longer belongs），
+        # 点击失败必须重新 sync —— 每次 sync 的 ref 都不一样，不能复用。
+        clicked = False
+        for attempt in range(4):
             ctx, text = coop()
             btn = re.search(r'(@e\d+) button "Checkin"', text)
-            if btn or "Checkin! Got" in text:
+            if btn:
+                log(f"点击 Checkin 按钮 {btn.group(1)}（第 {attempt + 1} 次尝试）")
+                if click(btn.group(1), ctx):
+                    clicked = True
+                    break
+                log("点击失败，重新同步后重试")
+                time.sleep(2)
+                continue
+            if "Checkin! Got" in text:
                 break
-            time.sleep(1.5)
-
-        if not btn:
-            log("没有可点的 Checkin 按钮（今天可能已签到）")
-        else:
-            log(f"点击 Checkin 按钮 {btn.group(1)}")
-            click(btn.group(1), ctx)
+            log(f"还没看到 Checkin 按钮（第 {attempt + 1} 次），2 秒后重看")
+            time.sleep(2)
 
             # 点完之后 Turnstile 可能是异步加载的（实测 2026-11-16：
             # 页面加载 15 秒都没有验证框，点 Checkin 后才出现）。
