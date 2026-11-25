@@ -57,7 +57,7 @@ def read_input(from_file):
         return p.read_text(encoding="utf-8", errors="replace")
     if not sys.stdin.isatty():
         return sys.stdin.read()
-    print("把浏览器复制的 Cookie 粘进来，输入空行结束：")
+    print("把浏览器复制的 Cookie 粘进来，然后回车：")
     lines = []
     while True:
         try:
@@ -66,8 +66,11 @@ def read_input(from_file):
             break
         if not line.strip():
             break
-        lines.append(line)
-    return "\n".join(lines)
+        lines.append(line.strip())
+        # Cookie 头一般是一行，看到会话字段就收工，省一次回车
+        if "=" in line and ("gld:sess" in line or "koa:sess" in line):
+            break
+    return " ".join(lines)
 
 
 def verify(cookie):
