@@ -113,6 +113,38 @@ def ensure_daemon():
     return False
 
 
+def ensure_chrome():
+    """浏览器兜底前确保有 Chrome 在跑。
+
+    API 正常时根本走不到这里，所以日常运行不会启动任何浏览器。
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+            capture_output=True, text=True, timeout=20, errors="replace",
+        ).stdout
+        if "chrome.exe" in out.lower():
+            return True
+    except Exception as e:  # noqa: BLE001
+        log(f"检测 Chrome 失败: {type(e).__name__}")
+
+    for exe in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")):
+        if not Path(exe).exists():
+            continue
+        log("启动 Chrome（浏览器兜底需要）")
+        try:
+            subprocess.Popen([exe, "--no-startup-window"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:  # noqa: BLE001
+            log(f"启动 Chrome 失败: {type(e).__name__}")
+            return False
+        time.sleep(12)  # 等扩展连上 daemon
+        return True
+    log("找不到 chrome.exe")
+    return False
+
+
 def pick_browser():
     code, out = run_bsk(["browsers", "--json"])
     if code != 0:
@@ -441,6 +473,7 @@ def main():
     try:
         if not ensure_daemon():
             raise RuntimeError("bsk daemon 无法启动")
+        ensure_chrome()
         browser, browser_name = pick_browser()
         code, out = run_bsk(["session", "start", "--browser", browser,
                              "--agent-name", "GLaDOS自动签到", "--json"])
