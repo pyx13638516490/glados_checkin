@@ -92,7 +92,7 @@ def verify(cookie):
                     left = int(float(left))
                 except (TypeError, ValueError):
                     left = "?"
-                return True, f"登录态有效，剩余 {left} 天（{base}）"
+                return True, f"登录态有效（套餐剩余 {left} 天）"
             return False, f"{base} 返回 {str(data)[:100]}"
         except Exception as e:  # noqa: BLE001
             print(f"  {base} 请求异常: {type(e).__name__}")
