@@ -349,6 +349,46 @@ def solve_turnstile(session, coop, click):
     return text, False
 
 
+def try_refresh_cookie():
+    """浏览器兜底之后，顺手把浏览器里那份 cookie 拿回 cookie.txt，恢复 API 路径。
+
+    硬限制：读 cookie 需要 Chrome 独占 user-data-dir，所以
+      * Chrome 已经关了 → 直接读，成功后下一次就走 2 秒的 API
+      * Chrome 还开着   → 绝不为读 cookie 去关用户正在用的浏览器，返回指引
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import refresh_cookie as rc
+    except Exception as e:  # noqa: BLE001
+        log(f"加载 refresh_cookie 失败: {type(e).__name__}")
+        return ""
+
+    try:
+        if rc.chrome_running():
+            log("Chrome 还开着，跳过自动恢复 cookie")
+            return ("Chrome 还开着，读不了它的 cookie（profile 独占）。\n"
+                    "想恢复 2 秒的 API 路径：双击 read-cookie.bat，或运行\n"
+                    "  python tools/refresh_cookie.py --read")
+        chrome = rc.find_chrome()
+        if not chrome:
+            return ""
+        log("Chrome 已关闭，尝试从浏览器恢复 cookie")
+        code = rc.read_from_browser(
+            chrome, 9222,
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data"),
+            "Default", False,
+        )
+        if code == 0:
+            log("cookie 已从浏览器写回，下次走 API")
+            return "✓ 已从浏览器把登录态读回 cookie.txt，下次会走 2 秒的 API 路径。"
+        log(f"自动恢复 cookie 失败（退出码 {code}）")
+        return ("自动恢复 cookie 没成功。可以手动跑：\n"
+                "  python tools/refresh_cookie.py --read")
+    except Exception as e:  # noqa: BLE001
+        log(f"自动恢复 cookie 异常: {type(e).__name__}")
+        return ""
+
+
 def main():
     sendkey = load_sendkey()
     state = load_state()
@@ -522,13 +562,10 @@ def main():
                     f"请打开页面手动确认一下。")
             rc = 1
 
-        if api_note == "cookie":
-            body += ("\n\n⚠️ cookie.txt 已失效，本次是浏览器完成的。\n"
-                     "运行 python tools/save_cookie.py 粘贴一次新 cookie，"
-                     "下次就回到 2 秒的 API 路径。")
-        elif api_note == "missing":
-            body += ("\n\n⚠️ 没有 cookie.txt，本次是浏览器完成的。\n"
-                     "运行 python tools/save_cookie.py 可以启用更快的 API 路径。")
+        if api_note in ("cookie", "missing"):
+            note = try_refresh_cookie()
+            if note:
+                body += "\n\n" + note
 
         push(sendkey, title, body)
         save_state({
