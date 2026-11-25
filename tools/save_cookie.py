@@ -103,6 +103,19 @@ def verify(cookie):
     return False, "两个域名都没验证成功"
 
 
+def write_cookie(cookie):
+    """备份旧文件后写入新的 cookie；返回写入后的路径。"""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if COOKIE_FILE.exists():
+        stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
+        bak = COOKIE_FILE.with_name(f"cookie.txt.bak-{stamp}")
+        shutil.copy2(COOKIE_FILE, bak)
+        print(f"旧文件已备份: {bak.name}")
+    COOKIE_FILE.write_text(cookie, encoding="utf-8")
+    print(f"✓ 已写入 {COOKIE_FILE}（{len(cookie)} 字节）")
+    return COOKIE_FILE
+
+
 def main():
     ap = argparse.ArgumentParser(description="更新 GLaDOS cookie.txt")
     ap.add_argument("--from-file", help="从文件读取，而不是交互粘贴")
@@ -131,14 +144,7 @@ def main():
             print("没有写入。确认是从已登录的浏览器里复制的，再试一次。")
             return 2
 
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    if COOKIE_FILE.exists():
-        stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
-        bak = COOKIE_FILE.with_name(f"cookie.txt.bak-{stamp}")
-        shutil.copy2(COOKIE_FILE, bak)
-        print(f"旧文件已备份: {bak.name}")
-    COOKIE_FILE.write_text(cookie, encoding="utf-8")
-    print(f"✓ 已写入 {COOKIE_FILE}（{len(cookie)} 字节）")
+    write_cookie(cookie)
     return 0
 
 
