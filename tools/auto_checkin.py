@@ -356,10 +356,12 @@ def main():
     # ---------- 第一阶段：纯 HTTP API（默认路径） ----------
     # 不碰浏览器：没有 daemon、没有 Chrome 前台、没有 cooperate context。
     cookie = ""
+    api_note = ""
     if COOKIE_FILE.exists():
         cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
     if not cookie:
         log("没有 cookie.txt，跳过 API，直接用浏览器")
+        api_note = "missing"
     else:
         res = api_checkin(cookie)
         status = res.get("status")
@@ -367,10 +369,14 @@ def main():
             return report_api(sendkey, state, res)
         if status == "turnstile":
             log("API 被 Turnstile 拦住 → 降级到浏览器")
+            api_note = "turnstile"
         elif status == "auth":
             log("Cookie 已失效 → 降级到浏览器")
+            log("提示：浏览器签完后运行 python tools/save_cookie.py 更新 cookie.txt")
+            api_note = "cookie"
         else:
             log("API 请求失败 → 降级到浏览器")
+            api_note = "error"
 
     # ---------- 第二阶段：浏览器兜底 ----------
     session = None
@@ -489,23 +495,40 @@ def main():
         except (TypeError, ValueError):
             pass
 
+        # 只看积分有没有涨来兜底判断：页面上的 "Checkin! Got N Points" 可能是
+        # 昨天留下的状态（2026-11-24 就是因为 "[disabled]" 被当成已签到而误报成功）。
+        gained = None
+        try:
+            if prev_points is not None and points is not None:
+                gained = int(float(points)) - int(prev_points)
+        except (TypeError, ValueError):
+            pass
+
         if got:
             title = f"GLaDOS 签到成功 ✅ +{got.group(1)} 分（共 {points}）"
             body = (f"本次入账：+{got.group(1)} 分\n"
                     f"当前积分：{points}{delta}\n"
                     f"连续签到：{streak} 天\n剩余天数：{days} 天")
             rc = 0
-        elif "Checkin! Got" in text or "[disabled]" in text:
+        elif gained is not None and gained > 0:
             title = f"GLaDOS 今天已签到（{points} 分）"
             body = (f"当前积分：{points}{delta}\n连续签到：{streak} 天\n剩余天数：{days} 天\n"
-                    f"页面上已经是签到后的状态，未重复提交。")
+                    f"积分比上次多了 {gained}，确认签到已生效。")
             rc = 1
         else:
             title = "GLaDOS 签到未确认 ⚠️"
-            body = (f"没有读到 \"Checkin! Got N Points\"。\n"
+            body = (f"没有读到 \"Checkin! Got N Points\"，积分也没有变化。\n"
                     f"当前积分：{points}\n连续签到：{streak} 天\n"
                     f"请打开页面手动确认一下。")
             rc = 1
+
+        if api_note == "cookie":
+            body += ("\n\n⚠️ cookie.txt 已失效，本次是浏览器完成的。\n"
+                     "运行 python tools/save_cookie.py 粘贴一次新 cookie，"
+                     "下次就回到 2 秒的 API 路径。")
+        elif api_note == "missing":
+            body += ("\n\n⚠️ 没有 cookie.txt，本次是浏览器完成的。\n"
+                     "运行 python tools/save_cookie.py 可以启用更快的 API 路径。")
 
         push(sendkey, title, body)
         save_state({
