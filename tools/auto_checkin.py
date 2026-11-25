@@ -350,11 +350,15 @@ def solve_turnstile(session, coop, click):
 
 
 def try_refresh_cookie():
-    """浏览器兜底之后，顺手把浏览器里那份 cookie 拿回 cookie.txt，恢复 API 路径。
+    """浏览器兜底之后，把浏览器里那份 cookie 读回 cookie.txt，恢复 API 路径。
 
-    硬限制：读 cookie 需要 Chrome 独占 user-data-dir，所以
-      * Chrome 已经关了 → 直接读，成功后下一次就走 2 秒的 API
-      * Chrome 还开着   → 绝不为读 cookie 去关用户正在用的浏览器，返回指引
+    读 cookie 要求 Chrome 独占 user-data-dir，所以这里会：
+      1. 记下 Chrome 原本是否开着
+      2. 开着就 taskkill 掉（未保存的页面会丢——这是你选的激进模式）
+      3. 用 CDP 把登录态读回来
+      4. 不管成功失败，都把 Chrome 重新打开
+
+    18:10 浏览器兜底时 Chrome 必然是开着的，所以这条路径就是那时候的主力。
     """
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -363,30 +367,44 @@ def try_refresh_cookie():
         log(f"加载 refresh_cookie 失败: {type(e).__name__}")
         return ""
 
+    chrome = rc.find_chrome()
+    if not chrome:
+        log("找不到 chrome.exe，跳过自动恢复")
+        return ""
+
+    was_running = rc.chrome_running()
+    if was_running:
+        log("关闭 Chrome 以读取登录态（读完后会自动重新打开）")
+        try:
+            subprocess.run(["taskkill", "/IM", "chrome.exe", "/F"],
+                           capture_output=True, text=True, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            log(f"关闭 Chrome 失败: {type(e).__name__}")
+        time.sleep(3)
+
+    code = 2
     try:
-        if rc.chrome_running():
-            log("Chrome 还开着，跳过自动恢复 cookie")
-            return ("Chrome 还开着，读不了它的 cookie（profile 独占）。\n"
-                    "想恢复 2 秒的 API 路径：双击 read-cookie.bat，或运行\n"
-                    "  python tools/refresh_cookie.py --read")
-        chrome = rc.find_chrome()
-        if not chrome:
-            return ""
-        log("Chrome 已关闭，尝试从浏览器恢复 cookie")
+        log("从浏览器读取 cookie")
         code = rc.read_from_browser(
             chrome, 9222,
             os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data"),
             "Default", False,
         )
-        if code == 0:
-            log("cookie 已从浏览器写回，下次走 API")
-            return "✓ 已从浏览器把登录态读回 cookie.txt，下次会走 2 秒的 API 路径。"
-        log(f"自动恢复 cookie 失败（退出码 {code}）")
-        return ("自动恢复 cookie 没成功。可以手动跑：\n"
-                "  python tools/refresh_cookie.py --read")
     except Exception as e:  # noqa: BLE001
-        log(f"自动恢复 cookie 异常: {type(e).__name__}")
-        return ""
+        log(f"读取 cookie 异常: {type(e).__name__}")
+    finally:
+        if was_running:
+            log("重新打开 Chrome")
+            try:
+                subprocess.Popen([chrome], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception as e:  # noqa: BLE001
+                log(f"重新打开 Chrome 失败: {type(e).__name__}")
+
+    if code == 0:
+        return "✓ 已从浏览器把登录态读回 cookie.txt，下次会走 2 秒的 API 路径。"
+    return ("从浏览器读 cookie 没成功。手动跑一次：\n"
+            "  python tools/refresh_cookie.py --read")
 
 
 def main():
