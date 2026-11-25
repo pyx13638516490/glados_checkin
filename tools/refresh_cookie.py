@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""把 cookie.txt 写回 Chrome，或验证 CDP 链路本身。
+"""用 Chrome DevTools Protocol 从浏览器读 GLaDOS cookie，更新 cookie.txt。
 
-## 为什么这个脚本只有 --restore，没有"自动读取"
+## 为什么能读到（和之前失败的区别）
 
-试过 CDP 路线，结论是当前 Chrome 157 上读不出来，而且有破坏性：
+Chrome 157 的 cookie 是 App-Bound 加密，密钥只在**正常实例**（有窗口、
+elevation service 可用）里存在。所以：
 
-  * Chrome 157 拒绝在默认 profile 目录上开 --remote-debugging-port
-    （"DevTools remote debugging requires a non-default data directory"）
-  * 用目录联接（junction）指向原 profile 可以绕过这个检查，端口能起来，
-    Network.getAllCookies 也能调通
-  * 但 App-Bound Encryption 的密钥只在 Chrome 的正常实例里可用；headless
-    实例解不开原库的 cookie → 它把这些"无效"条目当成垃圾清掉了
-    （实测：8 条 glados cookie 被清空，事后用 cookie.txt 才恢复回来）
+  * `--headless=new` 启动 → 解不开 → Chrome 把这些 cookie 当垃圾清掉（踩过）
+  * **带窗口启动** → 能解密 → `Network.getAllCookies` 直接拿到明文值 ✓
 
-所以"自动读 cookie"这条路在当前版本上不成立。要更新 cookie.txt，用
-`tools/save_cookie.py` 粘贴一次（30 秒），那是安全的。
+另一个坑：Chrome 157 拒绝在默认 profile 目录上开调试端口
+（"DevTools remote debugging requires a non-default data directory"）。
+用目录联接（junction）指向原 profile 可以绕过：路径看起来不同，实际读写
+仍是原 profile，所以不用复制几 GB 的数据。
 
-这个脚本留下来做两件仍然有价值的事：
-  * --self-test  用临时 profile 验证 CDP 能读写 HttpOnly cookie（不碰你的登录态）
-  * --restore    把 cookie.txt 里的凭据写回 Chrome —— 浏览器掉登录态时能救回来
-                 （换电脑、清过缓存、或者被别的工具弄丢过，都用这个）
+## 安全措施
 
-用法：
-    python tools/refresh_cookie.py --self-test
-    python tools/refresh_cookie.py --restore          # 需要先完全退出 Chrome
-    python tools/refresh_cookie.py --restore --kill-chrome
+  * 读之前先备份整个 Cookies 库到临时目录
+  * 读完检查原库条目数，变少就自动从备份恢复
+  * cookie.txt 只在「与浏览器里的不一致」且「在线验证通过」时才覆盖，覆盖前再备份
+
+## 用法
+
+    python tools/refresh_cookie.py --read            # 从浏览器更新 cookie.txt
+    python tools/refresh_cookie.py --read --dry-run  # 只对比，不写
+    python tools/refresh_cookie.py --read --kill-chrome   # 自动关 Chrome
+    python tools/refresh_cookie.py --restore         # 反方向：cookie.txt 写回浏览器
+    python tools/refresh_cookie.py --self-test       # 验证 CDP 读写链路（临时 profile）
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -48,7 +51,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
-from save_cookie import COOKIE_FILE, verify  # noqa: E402
+from save_cookie import COOKIE_FILE, verify, write_cookie  # noqa: E402
+
+WANTED = ["gld:accts", "gld:accts.sig", "gld:sess", "gld:sess.sig",
+          "koa:sess", "koa:sess.sig"]
 
 CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -75,7 +81,33 @@ def chrome_running():
         return False
 
 
-def launch(chrome, port, user_data_dir, profile_name="Default", headless=True):
+def count_glados(db_path):
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute("select count(*) from cookies where host_key like '%glados%'")
+        n = cur.fetchone()[0]
+        con.close()
+        return n
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def backup_cookies(cookie_dir):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bak = Path(tempfile.gettempdir()) / f"ck-backup-{stamp}"
+    bak.mkdir(parents=True, exist_ok=True)
+    for f in cookie_dir.glob("Cookies*"):
+        shutil.copy2(f, bak / f.name)
+    return bak
+
+
+def restore_cookies(bak, cookie_dir):
+    for f in bak.iterdir():
+        shutil.copy2(f, cookie_dir / f.name)
+
+
+def launch(chrome, port, user_data_dir, profile_name="Default", headless=False):
     args = [
         chrome,
         f"--remote-debugging-port={port}",
@@ -83,18 +115,18 @@ def launch(chrome, port, user_data_dir, profile_name="Default", headless=True):
         f"--profile-directory={profile_name}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-sync",
         "--remote-allow-origins=*",
-        "about:blank",
     ]
     if headless:
         args.insert(1, "--headless=new")
+        args.append("about:blank")
+    else:
+        args += ["--new-window", "about:blank"]
     return subprocess.Popen(args, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
-def endpoints(port, timeout=40):
-    """等端口就绪，返回 (page_ws, browser_ws)。"""
+def endpoints(port, timeout=60):
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -113,7 +145,7 @@ def endpoints(port, timeout=40):
     raise RuntimeError(f"{timeout} 秒内拿不到调试目标（最后错误: {last}）")
 
 
-async def cdp_seq(ws_url, commands, timeout=25):
+async def cdp_seq(ws_url, commands, timeout=30):
     out = []
     async with websockets.connect(
         ws_url, max_size=32 * 1024 * 1024, open_timeout=timeout
@@ -132,10 +164,23 @@ async def cdp_seq(ws_url, commands, timeout=25):
     return out
 
 
+def make_junction(name):
+    junc = Path(tempfile.gettempdir()) / name
+    if junc.exists():
+        subprocess.run(["cmd", "/c", "rmdir", str(junc)], capture_output=True)
+    return junc
+
+
+def drop_junction(junc):
+    if junc and junc.exists():
+        subprocess.run(["cmd", "/c", "rmdir", str(junc)], capture_output=True)
+
+
 def parse_cookie_file():
-    raw = COOKIE_FILE.read_text(encoding="utf-8").strip()
+    if not COOKIE_FILE.exists():
+        return {}
     pairs = {}
-    for item in raw.split(";"):
+    for item in COOKIE_FILE.read_text(encoding="utf-8").strip().split(";"):
         name, _, value = item.strip().partition("=")
         if name and value:
             pairs[name] = value
@@ -143,27 +188,23 @@ def parse_cookie_file():
 
 
 def self_test(chrome, port):
-    """临时 profile：写一个 HttpOnly cookie 再读回来，完全不碰你的登录态。"""
-    port += 1
     tmp = tempfile.mkdtemp(prefix="ck-selftest-")
     print(f"临时 profile: {tmp}")
-    proc = launch(chrome, port, tmp, "Default", headless=True)
+    proc = launch(chrome, port + 1, tmp, "Default", headless=True)
     try:
-        page_ws, _ = endpoints(port, timeout=30)
-        set_res, get_res = asyncio.run(cdp_seq(page_ws, [
-            ("Network.setCookie", {
-                "name": "gld:sess", "value": "TEST-VALUE-123",
-                "domain": ".glados.rocks", "path": "/",
-                "httpOnly": True, "secure": True,
-            }),
+        page_ws, _ = endpoints(port + 1, timeout=30)
+        _, get_res = asyncio.run(cdp_seq(page_ws, [
+            ("Network.setCookie", {"name": "gld:sess", "value": "TEST-VALUE-123",
+                                   "domain": ".glados.rocks", "path": "/",
+                                   "httpOnly": True, "secure": True}),
             ("Network.getAllCookies", {}),
         ]))
         got = [c for c in get_res.get("cookies", [])
                if c.get("name") == "gld:sess" and "glados" in (c.get("domain") or "")]
         if got and got[0].get("value") == "TEST-VALUE-123":
-            print(f"✓ 自测通过：读写 HttpOnly cookie 正常（httpOnly={got[0].get('httpOnly')}）")
+            print("✓ 自测通过：CDP 读写 HttpOnly cookie 正常")
             return 0
-        print(f"✗ 自测失败，读回: {got}")
+        print(f"✗ 自测失败: {got}")
         return 2
     except Exception as e:  # noqa: BLE001
         print(f"✗ 自测异常: {type(e).__name__}: {e}")
@@ -177,36 +218,108 @@ def self_test(chrome, port):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def restore(chrome, port, user_data, profile_name):
-    """把 cookie.txt 写回 Chrome 的 cookie 库（Chrome 自己加密，所以能落盘）。"""
-    if chrome_running():
-        print("✗ Chrome 正在运行，user-data-dir 被独占。先完全退出 Chrome。")
-        return 3
-    if not COOKIE_FILE.exists():
-        print(f"✗ 没有 {COOKIE_FILE}，没东西可恢复")
+def read_from_browser(chrome, port, user_data, profile_name, dry_run):
+    ckdir = Path(user_data) / profile_name / "Network"
+    if not ckdir.exists():
+        ckdir = Path(user_data) / profile_name
+    db = ckdir / "Cookies"
+    if not db.exists():
+        print(f"✗ 找不到 cookie 库: {db}")
         return 2
 
+    bak = backup_cookies(ckdir)
+    before = count_glados(bak / "Cookies")
+    print(f"已备份到 {bak}（glados 条目 {before}）")
+
+    junc = make_junction("ck-read-junction")
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(junc), str(user_data)],
+                   capture_output=True, text=True, check=True)
+    print("启动带窗口 Chrome（会闪一下窗口，读完自动关）...")
+    proc = launch(chrome, port, junc, profile_name, headless=False)
+    cookie = ""
+    try:
+        page_ws, browser_ws = endpoints(port)
+        time.sleep(3)  # 让 CookieMonster 把库里的 cookie 加载进内存
+        res = asyncio.run(cdp_seq(page_ws, [("Network.getAllCookies", {})]))[0]
+        cookies = res.get("cookies", [])
+        picked = {}
+        for c in cookies:
+            name = c.get("name")
+            if name in WANTED and "glados" in (c.get("domain") or ""):
+                picked[name] = c.get("value")
+        print(f"CDP 拿到 glados 字段: {', '.join(picked) if picked else '无'}")
+        if not picked:
+            print("✗ 浏览器里没有 glados cookie（可能没登录，或 profile 选错了）")
+            return 2
+        cookie = "; ".join(f"{n}={picked[n]}" for n in WANTED if n in picked)
+
+        # 优雅关闭，避免 Chrome 来不及 flush
+        try:
+            asyncio.run(cdp_seq(browser_ws, [("Browser.close", {})], timeout=10))
+        except Exception:  # noqa: BLE001
+            pass
+        for _ in range(30):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        drop_junction(junc)
+        after = count_glados(db)
+        print(f"原库 glados 条目: {after}（读前 {before}）")
+        if after < before:
+            print("库被削了，从备份恢复 ...")
+            restore_cookies(bak, ckdir)
+            print(f"恢复后: {count_glados(db)}")
+        elif after == before:
+            print("原库完好")
+
+    old = parse_cookie_file()
+    if old == picked:
+        print("✓ 浏览器里的 cookie 和 cookie.txt 完全一致，不用更新")
+        return 0
+    if not old:
+        print("cookie.txt 里没有字段，直接写入")
+    else:
+        changed = [n for n in picked if old.get(n) != picked[n]]
+        print(f"差异字段: {', '.join(changed) if changed else '（仅顺序/多余字段不同）'}")
+
+    if dry_run:
+        print(f"[dry-run] 不写文件。读取长度 {len(cookie)}")
+        return 0
+
+    ok, msg = verify(cookie)
+    print(("✓ " if ok else "✗ ") + msg)
+    if not ok:
+        print("不写入。浏览器里这份 cookie 服务端已不认，需要重新登录。")
+        return 2
+    write_cookie(cookie)
+    return 0
+
+
+def restore_to_browser(chrome, port, user_data, profile_name):
     pairs = parse_cookie_file()
     if not pairs:
-        print("✗ cookie.txt 是空的")
+        print("✗ cookie.txt 是空的，没东西可恢复")
         return 2
-    print(f"cookie.txt 有 {len(pairs)} 个字段: {', '.join(pairs)}")
-
+    print(f"cookie.txt 有 {len(pairs)} 个字段")
     ok, msg = verify("; ".join(f"{k}={v}" for k, v in pairs.items()))
     print(("✓ " if ok else "✗ ") + msg)
     if not ok:
-        print("不写回。这份 cookie 在服务端已经失效，先重新登录再更新 cookie.txt。")
+        print("不写回：这份 cookie 服务端已失效，先重新登录再更新 cookie.txt。")
         return 2
 
-    # Chrome 157 只肯在"非默认目录"上开调试端口；junction 让路径看起来不同，
-    # 实际读写仍是原 profile（所以 cookie 会落到真正的库里）。
-    junc = Path(tempfile.gettempdir()) / "ck-restore-junction"
-    if junc.exists():
-        subprocess.run(["cmd", "/c", "rmdir", str(junc)], capture_output=True)
+    ckdir = Path(user_data) / profile_name / "Network"
+    if not ckdir.exists():
+        ckdir = Path(user_data) / profile_name
+    bak = backup_cookies(ckdir)
+    print(f"已备份到 {bak}")
+
+    junc = make_junction("ck-restore-junction")
     subprocess.run(["cmd", "/c", "mklink", "/J", str(junc), str(user_data)],
                    capture_output=True, text=True, check=True)
-
-    proc = launch(chrome, port, junc, profile_name, headless=True)
+    proc = launch(chrome, port, junc, profile_name, headless=False)
     try:
         page_ws, browser_ws = endpoints(port)
         expires = int(time.time()) + 30 * 86400
@@ -220,44 +333,39 @@ def restore(chrome, port, user_data, profile_name):
         res = asyncio.run(cdp_seq(page_ws, cmds))
         okn = sum(1 for r in res if not r.get("error"))
         print(f"setCookie: {okn}/{len(cmds)} 成功")
-        for r in res:
-            if r.get("error"):
-                print("  失败:", r["error"])
-
-        # 必须优雅关闭，否则 Chrome 不 flush 到磁盘（强制结束会丢）
         time.sleep(3)
         try:
             asyncio.run(cdp_seq(browser_ws, [("Browser.close", {})], timeout=10))
         except Exception:  # noqa: BLE001
-            pass  # 连接被关闭是预期行为
+            pass
         for _ in range(30):
             if proc.poll() is not None:
                 break
             time.sleep(0.5)
-        print("Chrome 已退出，cookie 已落盘")
+        print("已写回浏览器")
         return 0 if okn == len(cmds) else 2
     except Exception as e:  # noqa: BLE001
-        print(f"✗ 恢复失败: {type(e).__name__}: {e}")
+        print(f"✗ 失败: {type(e).__name__}: {e}")
         return 2
     finally:
         if proc.poll() is None:
             proc.terminate()
-        if junc.exists():
-            subprocess.run(["cmd", "/c", "rmdir", str(junc)], capture_output=True)
-        print("junction 已清理")
+        drop_junction(junc)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CDP 工具：恢复 cookie 到 Chrome / 自测")
+    ap = argparse.ArgumentParser(
+        description="从 Chrome 读 cookie 更新 cookie.txt（或反向写回）")
     ap.add_argument("--port", type=int, default=9222)
     ap.add_argument("--profile", default=os.path.expandvars(
         r"%LOCALAPPDATA%\Google\Chrome\User Data"))
     ap.add_argument("--profile-name", default="Default")
     ap.add_argument("--kill-chrome", action="store_true",
                     help="先结束 chrome.exe（未保存页面会丢）")
+    ap.add_argument("--read", action="store_true", help="从浏览器读并更新 cookie.txt")
+    ap.add_argument("--restore", action="store_true", help="把 cookie.txt 写回浏览器")
+    ap.add_argument("--dry-run", action="store_true", help="只对比不写文件")
     ap.add_argument("--self-test", action="store_true", help="验证 CDP 读写链路")
-    ap.add_argument("--restore", action="store_true",
-                    help="把 cookie.txt 写回 Chrome（浏览器掉登录态时用）")
     args = ap.parse_args()
 
     chrome = find_chrome()
@@ -268,20 +376,30 @@ def main():
     if args.self_test:
         return self_test(chrome, args.port)
 
-    if not args.restore:
-        print("这个工具不做'自动读取 cookie'，原因见文件头注释。\n"
-              "  更新 cookie.txt → python tools/save_cookie.py\n"
-              "  把 cookie.txt 写回浏览器 → python tools/refresh_cookie.py --restore\n"
-              "  只想验证 CDP 是否可用 → --self-test")
+    if not (args.read or args.restore):
+        print("用法：\n"
+              "  从浏览器更新 cookie.txt   → --read\n"
+              "  把 cookie.txt 写回浏览器   → --restore\n"
+              "  验证 CDP 链路             → --self-test")
         return 1
 
-    if args.kill_chrome and chrome_running():
+    if chrome_running():
+        if not args.kill_chrome:
+            print("✗ Chrome 正在运行，它的 user-data-dir 是独占的。\n"
+                  "  先完全退出 Chrome，或加 --kill-chrome 让我关（未保存页面会丢）。")
+            return 3
         print("关闭 Chrome ...")
         subprocess.run(["taskkill", "/IM", "chrome.exe", "/F"],
                        capture_output=True, text=True, timeout=60)
         time.sleep(3)
+        if chrome_running():
+            print("✗ 还有 chrome.exe 没退干净")
+            return 2
 
-    return restore(chrome, args.port, args.profile, args.profile_name)
+    if args.read:
+        return read_from_browser(chrome, args.port, args.profile,
+                                 args.profile_name, args.dry_run)
+    return restore_to_browser(chrome, args.port, args.profile, args.profile_name)
 
 
 if __name__ == "__main__":
