@@ -134,12 +134,33 @@ def ensure_chrome():
             continue
         log("启动 Chrome（浏览器兜底需要）")
         try:
-            subprocess.Popen([exe, "--no-startup-window"],
+            # 不能用 --no-startup-window：没有窗口时 Chrome 主进程会立刻退出，
+            # 2026-11-26 就是这样导致 bsk 只能回落到没登录的 Edge。
+            subprocess.Popen([exe, "--new-window", "about:blank"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:  # noqa: BLE001
             log(f"启动 Chrome 失败: {type(e).__name__}")
             return False
-        time.sleep(12)  # 等扩展连上 daemon
+
+        # 等扩展连上 daemon，同时确认进程没退出
+        for _ in range(20):
+            time.sleep(2)
+            try:
+                out = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+                    capture_output=True, text=True, timeout=15, errors="replace",
+                ).stdout
+                alive = "chrome.exe" in out.lower()
+            except Exception:  # noqa: BLE001
+                alive = False
+            if not alive:
+                log("Chrome 启动后又退出了")
+                return False
+            code, bout = run_bsk(["browsers", "--json"], timeout=15)
+            if code == 0 and '"chrome"' in bout:
+                log("Chrome 已连接，扩展就绪")
+                return True
+        log("Chrome 已启动，但扩展 40 秒内没连上（继续交给 pick_browser 判断）")
         return True
     log("找不到 chrome.exe")
     return False
@@ -454,6 +475,16 @@ def main():
         api_note = "missing"
     else:
         res = api_checkin(cookie)
+        # Turnstile 是间歇性的（2026-11-26 实测：18:10、18:23 被拦，18:28 放行）。
+        # 被拦时先等一会儿重试，别急着降级到脆弱的浏览器链路。
+        if res.get("status") == "turnstile":
+            for i in range(2):
+                log(f"Turnstile 拦截，25 秒后重试（{i + 1}/2）")
+                time.sleep(25)
+                res = api_checkin(cookie)
+                if res.get("status") != "turnstile":
+                    log("重试通过")
+                    break
         status = res.get("status")
         if status in ("ok", "repeated"):
             return report_api(sendkey, state, res)
@@ -507,19 +538,30 @@ def main():
             return out
 
         run_bsk(["navigate", "--session", session, URL])
-        # 等页面真正渲染出来（Chrome 刚被拉起时，navigate 返回 load 不代表
-        # Vue 已经渲染完，过早 observe 会拿到空页面，POINTS 解析成 None）
-        loaded = False
-        for _ in range(12):
-            time.sleep(2)
-            t = observe()
-            if "POINTS" in t and "Checkin" in t:
-                loaded = True
-                break
-        if not loaded:
-            log("页面 24 秒内仍未渲染出 POINTS，继续尝试")
+        # 等页面真正可用。注意：POINTS 出现 **不代表** 按钮已进入 cooperate 的观察
+        # —— 2026-11-26 实测，cooperate 有时返回 length=0 的空文本，脚本把它当成
+        # "没有 Checkin 按钮"就直接放弃了，这才是那两次失败的真正原因。
+        # 所以判据改成「cooperate 的观察里出现 Checkin 按钮」，最多等 60 秒。
+        btn = None
+        ctx = None
+        deadline = time.time() + 60
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            ctx, text = coop()
+            if text:
+                btn = re.search(r'(@e\d+) button "Checkin"', text)
+                if btn or "Checkin! Got" in text:
+                    break
+            if attempt % 4 == 0:
+                log(f"页面还没就绪（第 {attempt} 次，观察文本 {len(text)} 字符）")
+            time.sleep(3)
+        if btn:
+            log(f"页面已渲染，Checkin 按钮 {btn.group(1)}")
+        elif "Checkin! Got" in (text or ""):
+            log("页面上已经是签到后的状态")
         else:
-            log("页面已渲染")
+            log("60 秒内没在观察里看到 Checkin 按钮，继续按最坏情况往下走")
 
         text, ok = solve_turnstile(session, coop, click)
         if not ok and "Verify you are human" in text:
@@ -529,8 +571,12 @@ def main():
         # cooperate 的 context 会过期（报 control context no longer belongs），
         # 点击失败必须重新 sync —— 每次 sync 的 ref 都不一样，不能复用。
         clicked = False
-        for attempt in range(4):
+        for attempt in range(6):
             ctx, text = coop()
+            if not text:
+                log(f"观察文本为空（第 {attempt + 1} 次），等 4 秒再看")
+                time.sleep(4)
+                continue
             btn = re.search(r'(@e\d+) button "Checkin"', text)
             if btn:
                 log(f"点击 Checkin 按钮 {btn.group(1)}（第 {attempt + 1} 次尝试）")
@@ -538,12 +584,12 @@ def main():
                     clicked = True
                     break
                 log("点击失败，重新同步后重试")
-                time.sleep(2)
+                time.sleep(3)
                 continue
             if "Checkin! Got" in text:
                 break
-            log(f"还没看到 Checkin 按钮（第 {attempt + 1} 次），2 秒后重看")
-            time.sleep(2)
+            log(f"还没看到 Checkin 按钮（第 {attempt + 1} 次），3 秒后重看")
+            time.sleep(3)
 
             # 点完之后 Turnstile 可能是异步加载的（实测 2026-11-16：
             # 页面加载 15 秒都没有验证框，点 Checkin 后才出现）。
