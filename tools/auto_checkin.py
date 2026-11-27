@@ -591,14 +591,15 @@ def main():
             log(f"还没看到 Checkin 按钮（第 {attempt + 1} 次），3 秒后重看")
             time.sleep(3)
 
-            # 点完之后 Turnstile 可能是异步加载的（实测 2026-11-16：
-            # 页面加载 15 秒都没有验证框，点 Checkin 后才出现）。
-            # 轮询观察，最多 30 秒，边等边处理。
-            deadline = time.time() + 30
+        # 点完之后必须等页面更新：签到是异步的，点完立刻 observe 读到的还是旧状态。
+        # 2026-11-27 就是这样把一次成功的签到报成了"未确认"（积分其实已经涨了）。
+        # Turnstile 也可能在点击后才异步出现（实测 2026-11-16）。
+        if clicked:
+            deadline = time.time() + 40
             while time.time() < deadline:
-                time.sleep(3)
-                text = observe()
-                if "Checkin! Got" in text:
+                time.sleep(4)
+                t = observe()
+                if "Checkin! Got" in t:
                     log("已拿到签到结果")
                     break
                 ctx2, ctext = coop()
@@ -614,6 +615,8 @@ def main():
                         if again:
                             click(again.group(1), ctx2)
                     continue
+            else:
+                log("40 秒内没读到 Checkin! Got，下面按积分变化判断")
 
         # 统一用全量 observe 读结果（cooperate 的 text 会被截断）
         text = observe()
